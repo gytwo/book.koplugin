@@ -1,8 +1,5 @@
 --[[--
-段评的阅读快捷面板：显示开关，以及给本地书关联微信读书书目。
-
-显示开关写当前页实际用的那份 `show_paragraph_reviews`：本章属主源自己有段评就写它，
-否则写微信读书（本地书、京东读书借段评）。和书源设置页是同一处，不另存一份。
+段评的阅读快捷面板：绑定、开关与显示段评。
 
 @module koplugin.book.features.reviews.panel
 --]]
@@ -13,72 +10,72 @@ local _ = require("gettext")
 
 local Panel = {}
 
---- 当前阅读页段评画线由哪个源的开关控制。
---- 第二个返回值：true = 本章属主源自己的段评，false = 借微信读书。
----@return string|nil
----@return boolean
-local function sourceId()
-    local cur = require("reader.session").current()
-    local identity = cur and cur.identity
-    if not identity or identity.ephemeral then return nil, false end
-    local source = identity.source --[[@as ParagraphReviewSource|nil]]
-    if source and (source.chapterReviewHotspotsAsync or (identity.chapter_idx and source.paragraphHotspotsAsync)) then
-        return source.id, true
-    end
-    local wechat = require("source.registry").resolve("wechat")
-    if wechat and wechat:configured() then return wechat.id, false end
-    return nil, false
-end
-
 ---@return BookQuickPanelAction[]
 function Panel.actions()
     return {
+        {
+            id = "wechat_bind",
+            title = _("关联微信读书"),
+            icon = "link",
+            scope = "reader",
+            -- 👇 只要不是订阅文章（ephemeral），统统允许绑定（包括 PDF）
+            available = function(ctx)
+                local ui = ctx and ctx.ui
+                if not ui then return false end
+                local cur = require("reader.session").current()
+                if not cur or not cur.identity then return false end
+                return not cur.identity.ephemeral
+            end,
+            run = function(ctx)
+                require("features.reviews.link").Bind.open(ctx.ui)
+            end,
+        },
+        {
+            id = "reviews_link_switch",
+            title = _("拉取微信段评"),
+            icon = "forum",
+            scope = "reader",
+            -- 👇 段评依然只对支持取字的排版文档（EPUB 等）开放，PDF 不显示
+            available = function(ctx)
+                local ui = ctx and ctx.ui
+                return not ui or require("features.reviews.linked").supported(ui.document)
+            end,
+            keep_open = true,
+            active = function(ctx)
+                local ui = ctx and ctx.ui
+                return ui ~= nil and require("features.reviews.linked").enabled(ui)
+            end,
+            run = function(ctx)
+                require("features.reviews.link").openPull(ctx.ui)
+            end,
+        },
         {
             id = "reviews_show",
             title = _("显示段评"),
             icon = "forum",
             scope = "reader",
             keep_open = true,
-            ---@param ctx BookQuickPanelContext|nil
-            ---@return boolean
-            available = function(ctx)
-                local ui = ctx and ctx.ui
-                if not ui then return true end
-                local id, own = sourceId()
-                if not id then return false end
-                if own then return true end
-                return require("features.reviews.link").available(ui)
-            end,
-            active = function()
-                local id = sourceId()
-                return id ~= nil and require("source.review_setting").enabled(id)
-            end,
-            ---@param ctx BookQuickPanelContext
-            run = function(ctx)
-                local id = sourceId()
-                if not id then return end
-                local ReviewSetting = require("source.review_setting")
-                ReviewSetting.set(id, not ReviewSetting.enabled(id))
-                local ui = ctx.ui
-                if ui and ui.dialog then
-                    require("ui/uimanager"):setDirty(ui.dialog, "ui")
-                end
-            end,
-        },
-        {
-            id = "wechat_reviews_link",
-            title = _("关联微信段评"),
-            icon = "forum",
-            scope = "reader",
-            ---@param ctx BookQuickPanelContext|nil
-            ---@return boolean
             available = function(ctx)
                 local ui = ctx and ctx.ui
                 return not ui or require("features.reviews.link").available(ui)
             end,
-            ---@param ctx BookQuickPanelContext
+            active = function()
+                local cur = require("reader.session").current()
+                local identity = cur and cur.identity
+                if not identity then return false end
+                local source = identity.source --[[@as ParagraphReviewSource|nil]]
+                local wechat = require("source.registry").resolve("wechat")
+                return wechat and require("source.review_setting").enabled(wechat.id) or false
+            end,
             run = function(ctx)
-                require("features.reviews.link").open(ctx.ui)
+                local wechat = require("source.registry").resolve("wechat")
+                if not wechat then return end
+                local ReviewSetting = require("source.review_setting")
+                ReviewSetting.set(wechat.id, not ReviewSetting.enabled(wechat.id))
+                local ui = ctx.ui
+                if ui and ui.dialog then
+                    require("ui/uimanager"):setDirty(ui.dialog, "ui")
+                end
             end,
         },
     }
