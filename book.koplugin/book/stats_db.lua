@@ -1175,4 +1175,17 @@ function StatsDB.markSynced(ids)
     end) == true
 end
 
+--- 把某本书的所有待上传记录标记为已同步（用于绑定微信书时清理历史积压）。
+---@param source_id string
+---@param stable_id string
+---@return boolean
+function StatsDB.markSyncedByBook(source_id, stable_id)
+    return DB.exec(
+        [[UPDATE reading_stats SET sync_status=1
+          WHERE source_id=? AND stable_id=? AND sync_status=0
+            AND record_type IN ('page','page_rollup');]],
+        source_id, stable_id
+    ) ~= nil
+end
+
 return StatsDB
