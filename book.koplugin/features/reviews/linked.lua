@@ -64,20 +64,40 @@ local AHEAD = 2
 ---@field job { job: { cancel: fun() }, page: integer }|nil 在飞的扫页子进程
 ---@field logged table<WechatReviewHotspot, boolean> 已记过「对不上」日志的原句
 
+--- 读关联（统一读新键 `wechat_book`）。
+---@param ui table ReaderUI
+---@return ReviewLink|nil
+--- 读关联（统一读新键 `wechat_book`）。
 ---@param ui table ReaderUI
 ---@return ReviewLink|nil
 function Linked.get(ui)
-    return ui.doc_settings and ui.doc_settings:readSetting(KEY)
+    if not ui.doc_settings then return nil end
+    return ui.doc_settings:readSetting("wechat_book")
 end
 
+--- 段评开关（旧键 `book_reviews_wechat` 作为布尔开关）。
 ---@param ui table ReaderUI
----@param link ReviewLink|nil nil = 解除关联
-function Linked.set(ui, link)
-    if link then
-        ui.doc_settings:saveSetting(KEY, link)
-    else
-        ui.doc_settings:delSetting(KEY)
+---@return boolean
+function Linked.enabled(ui)
+    if not ui.doc_settings then return false end
+    local val = ui.doc_settings:readSetting("book_reviews_wechat")
+    
+    -- 兼容旧版数据：以前这里存的是 table（包含 book_id 等）
+    if type(val) == "table" then
+        -- 顺手把书号迁移到新键（如果新键还没值的话）
+        if val.book_id and not ui.doc_settings:readSetting("wechat_book") then
+            ui.doc_settings:saveSetting("wechat_book", {
+                book_id = val.book_id,
+                title = val.title,
+                author = val.author,
+            })
+        end
+        -- 旧键覆盖成布尔开关，默认开启（因为老用户以前存 table 就是为了看段评）
+        ui.doc_settings:saveSetting("book_reviews_wechat", true)
+        return true
     end
+    
+    return val == true
 end
 
 --- 文档能按页取文字、找原句（排版引擎文档；PDF / 漫画没有这套接口）。
@@ -523,7 +543,9 @@ function Linked.target(ui, cache, redraw)
     local link = Linked.get(ui)
     if not (link and Linked.supported(ui.document)) then return nil end
     local source = require("source.registry").resolve("wechat") --[[@as ParagraphReviewSource]]
-    if not (source:configured() and source:paragraphReviewsEnabled()) then return nil end
+    if not source:configured() then return nil end
+    -- 本地书不看微信源全局开关，只看自己的“拉取微信段评”开关（旧键）
+    if not require("features.reviews.linked").enabled(ui) then return nil end
     return {
         key = "link\0" .. link.book_id,
         fetch = function(cb) return Linked.tocAsync(source, link.book_id, cb) end,
