@@ -9,7 +9,6 @@ local _ = require("gettext")
 
 local Setting = {}
 
--- 新安装默认启用的动作，顺序即面板顺序。feature 新开关不在这份列表里就保持关闭；已有配置仍保持用户选择。
 Setting.defaults = {
     quick_panel_plugins = {},
     quick_panel_actions = {
@@ -18,34 +17,87 @@ Setting.defaults = {
     quick_panel_brightness = true,
     quick_panel_warmth = true,
     quick_panel_reader_actions = { "toc", "font", "reflow", "highlights", "bookorbit", "xray", "page_turn", "settings" },
+    show_desktop_tab = true,
+    show_reader_tab = true,
 }
 
----@param desktop BookDesktop
----@return BookSettingEntry[]
 function Setting.entries(desktop)
     local QuickPanel = require("features.panel.settings")
     local T = require("ffi/util").template
+    local MoonSettings = require("utils.settings")
+    local Row = require("ui/themes/widgets/row")
+
     return {
+        -- 桌面快捷面板（归属 desktop 组）
         {
-            id = "desktop", group = "desktop", order = 30,
-            icon = "dashboard_customize", title = _("桌面快捷面板"), subtitle = _("面板开关与顺序"),
-            status = T(_("已启用 %1 项"), QuickPanel.enabledCount("desktop")), status_on = true,
+            id = "panel_desktop", group = "desktop", order = 30,
+            icon = "dashboard_customize",
+            title = _("桌面快捷面板"),
+            subtitle = _("面板开关与项目排序"),
+            status = T(_("已启用 %1 项"), QuickPanel.enabledCount("desktop")),
+            status_on = true,
             page = {
                 title = _("桌面快捷面板"),
                 docs = "/manual/desktop/actions",
                 preview = function(width) return QuickPanel.preview("desktop", width) end,
-                sections = function() return {{ title = _("桌面"), rows = QuickPanel.rows("desktop", desktop) }} end,
+                sections = function()
+                    local rows = {}
+                    -- 1. 桌面开关
+                    table.insert(rows, function(iw)
+                        local enabled = MoonSettings.get("features.panel").show_desktop_tab ~= false
+                        return Row.widget({
+                            width = iw, icon = "tab",
+                            title = _("启用桌面快捷面板"),
+                            toggle = enabled,
+                            callback = function()
+                                MoonSettings.get("features.panel").show_desktop_tab = not enabled
+                                MoonSettings.save("features.panel")
+                                desktop:updateView()
+                            end,
+                        })
+                    end)
+                    -- 2. 桌面动作列表
+                    for _, row in ipairs(QuickPanel.rows("desktop", desktop)) do
+                        rows[#rows + 1] = row
+                    end
+                    return { { title = _("桌面"), rows = rows } }
+                end,
             },
         },
+        -- 阅读快捷面板（归属 reader 组）
         {
-            id = "reader", group = "reader", order = 40,
-            icon = "dashboard_customize", title = _("阅读快捷面板"), subtitle = _("面板按钮与顺序"),
-            status = T(_("已启用 %1 项"), QuickPanel.enabledCount("reader")), status_on = true,
+            id = "panel_reader", group = "reader", order = 30,
+            icon = "dashboard_customize",
+            title = _("阅读快捷面板"),
+            subtitle = _("面板开关与项目排序"),
+            status = T(_("已启用 %1 项"), QuickPanel.enabledCount("reader")),
+            status_on = true,
             page = {
                 title = _("阅读快捷面板"),
                 docs = "/manual/reader/ui/panel",
                 preview = function(width) return QuickPanel.preview("reader", width) end,
-                sections = function() return {{ title = _("阅读"), rows = QuickPanel.rows("reader", desktop) }} end,
+                sections = function()
+                    local rows = {}
+                    -- 1. 阅读开关
+                    table.insert(rows, function(iw)
+                        local enabled = MoonSettings.get("features.panel").show_reader_tab ~= false
+                        return Row.widget({
+                            width = iw, icon = "tab",
+                            title = _("启用阅读快捷面板"),
+                            toggle = enabled,
+                            callback = function()
+                                MoonSettings.get("features.panel").show_reader_tab = not enabled
+                                MoonSettings.save("features.panel")
+                                desktop:updateView()
+                            end,
+                        })
+                    end)
+                    -- 2. 阅读动作列表
+                    for _, row in ipairs(QuickPanel.rows("reader", desktop)) do
+                        rows[#rows + 1] = row
+                    end
+                    return { { title = _("阅读"), rows = rows } }
+                end,
             },
         },
     }
