@@ -263,6 +263,15 @@ function Session.onReaderReady(plugin)
         return
     end
     span:lap("identity")
+    -- ★ 新增：本地书关联了微信读书书目，挂上微信源用于时长上报
+    if identity.source_id == "local" then
+        local link = ui.doc_settings and ui.doc_settings:readSetting("wechat_book")
+        if link and link.book_id then
+            identity.wechat_source = require("source.registry").resolve("wechat")
+            identity.wechat_book_id = link.book_id
+            identity.is_local_for_report = true
+        end
+    end
     Session._snapshot = Snapshot.new(ui, identity)
     installEndOfBookHandler(plugin, ui)
     local chapter_mode = identity.chapter_idx ~= nil
@@ -343,7 +352,19 @@ local function syncReading(plugin, span)
         lap("notes")
     end
     require("reader.session.stats").stop(function()
-        if source and source.syncStatsAsync then
+    if identity.is_local_for_report and identity.wechat_book_id then
+        require("book.stats").pushLocalAsWechat(
+            identity.source_id,
+            identity.wechat_source, 
+            identity.wechat_book_id,
+            function(ok, result, confirmed)
+                if not ok then
+                    require("utils.log").warn("本地书时长上报失败", result)
+                end
+            end
+        )
+        elseif source and source.syncStatsAsync then
+            -- 原有的源书时长同步逻辑
             source:syncStatsAsync({ dirty_only = true }, function()
                 if identity then pushProgress() end
             end)
