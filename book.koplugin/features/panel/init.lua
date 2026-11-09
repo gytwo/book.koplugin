@@ -22,6 +22,8 @@ local DISPATCHER_ACTIONS = {
     { id = "bookorbit",      title = _("月读：BookOrbit"), general = true },
     { id = "xray",           title = _("月读：X-Ray"),     reader = true },
     { id = "settings",       title = _("月读：阅读设置"),  reader = true },
+    { id = "reviews_show",        title = _("月读：显示段评"),     reader = true },
+    { id = "wechat_reviews_link", title = _("月读：关联微信段评"), reader = true },
 }
 
 --- 注册所有月读快捷面板动作为系统动作。
