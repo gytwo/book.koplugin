@@ -193,18 +193,53 @@ end
 local function fakeDav()
     local dav = { files = {}, calls = {}, timeouts = {} }
     function dav:put(path, data, mtime) self.files[path] = { data = data, mtime = mtime or os.time() } end
-    function dav:listAsync(path, cb)
+    function dav:listAsync(path, cb, opts)
         self.calls[#self.calls + 1] = "PROPFIND " .. path
+        self.depths = self.depths or {}
+        self.depths[#self.depths + 1] = (opts and opts.depth) or "1"
+        self.list_opts = self.list_opts or {}
+        self.list_opts[#self.list_opts + 1] = {
+            path = path,
+            depth = (opts and opts.depth) or "1",
+            timeout = opts and opts.timeout,
+            connect_timeout = opts and opts.connect_timeout,
+        }
+        if self.fail and self.fail[path] then
+            return cb(nil, self.fail[path])
+        end
+        local depth = opts and opts.depth or "1"
+        if depth == "infinity" then
+            if self.infinity_error then
+                return cb(nil, self.infinity_error, self.infinity_code)
+            end
+        end
+        local deep = depth == "infinity" and not self.infinity_shallow
         local seen, out = {}, {}
+        local function add(entry)
+            if not seen[entry.path] then
+                seen[entry.path] = true
+                out[#out + 1] = entry
+            end
+        end
         for p, f in pairs(self.files) do
             local rest = p:sub(1, #path + 1) == path .. "/" and p:sub(#path + 2)
             if rest then
-                local head, tail = rest:match("^([^/]+)/(.+)$")
-                local name = head or rest
-                if not seen[name] then
-                    seen[name] = true
-                    out[#out + 1] = { name = name, path = path .. "/" .. name, is_dir = tail ~= nil,
-                        mtime = not tail and f.mtime or nil, size = not tail and #f.data or nil }
+                if deep then
+                    local acc = path
+                    local segs = {}
+                    for seg in rest:gmatch("[^/]+") do segs[#segs + 1] = seg end
+                    for i = 1, #segs - 1 do
+                        acc = acc .. "/" .. segs[i]
+                        add({ name = segs[i], path = acc, is_dir = true,
+                            mtime = self.dir_mtime or 1000, size = 0 })
+                    end
+                    add({ name = segs[#segs], path = p, is_dir = false, mtime = f.mtime, size = #f.data })
+                else
+                    local head, tail = rest:match("^([^/]+)/(.+)$")
+                    local name = head or rest
+                    add({ name = name, path = path .. "/" .. name, is_dir = tail ~= nil,
+                        mtime = not tail and f.mtime or (self.dir_mtime or 1000),
+                        size = not tail and #f.data or nil })
                 end
             end
         end
@@ -387,6 +422,168 @@ do
     Assert.not_nil(books["webdav://分类/系列/书.epub"])
     Assert.is_nil(books["webdav://分类/系列/更深/书.epub"])
     Assert.eq(dav:count("PROPFIND " .. ROOT .. "/分类/系列/更深"), 0)
+    books = {}
+end
+
+-- 硬刷新优先一次 Depth:infinity 列出整库；Calibre 式「一文件夹一本书」不必再逐本 PROPFIND。
+do
+    local dav = fakeDav()
+    dav:put(ROOT .. "/第三牧场/第三牧场.epub", "x")
+    dav:put(ROOT .. "/分类/系列/书.epub", "x")
+    Assert.is_true(refresh(client(dav)))
+    Assert.not_nil(books["webdav://第三牧场/第三牧场.epub"])
+    Assert.not_nil(books["webdav://分类/系列/书.epub"])
+    local root_lists = 0
+    for _idx, c in ipairs(dav.calls) do
+        if c == "PROPFIND " .. ROOT then root_lists = root_lists + 1 end
+    end
+    Assert.eq(root_lists, 1, "只列一次书库根")
+    Assert.eq(dav:count("PROPFIND " .. ROOT .. "/第三牧场"), 0, "不进书文件夹")
+    local saw_infinity = false
+    for _idx, d in ipairs(dav.depths) do if d == "infinity" then saw_infinity = true end end
+    Assert.is_true(saw_infinity, "硬刷新先试 Depth:infinity")
+    local Timeout = require("http.timeout")
+    local root_opt
+    for _idx, o in ipairs(dav.list_opts or {}) do
+        if o.path == ROOT and o.depth == "infinity" then root_opt = o; break end
+    end
+    Assert.not_nil(root_opt)
+    Assert.eq(root_opt.timeout, Timeout.net(10), "根目录整包超时是网络超时×10")
+    Assert.eq(root_opt.connect_timeout, Timeout.net(10), "根目录连接超时不短于整包，避免被默认 20 秒掐掉")
+    books = {}
+end
+
+-- 服务器拒绝 / 忽略 Depth:infinity 时降级为并发下钻，仍能收书。
+do
+    local dav = fakeDav()
+    dav.infinity_error = "WebDAV 请求失败（HTTP 403）"
+    dav.infinity_code = 403
+    dav:put(ROOT .. "/第三牧场/第三牧场.epub", "x")
+    dav:put(ROOT .. "/另一本/另一本.epub", "x")
+    Assert.is_true(refresh(client(dav)))
+    Assert.not_nil(books["webdav://第三牧场/第三牧场.epub"])
+    Assert.not_nil(books["webdav://另一本/另一本.epub"])
+    Assert.is_true(dav:count("PROPFIND " .. ROOT .. "/第三牧场") >= 1)
+    books = {}
+end
+
+-- 本地书架已有、目录 mtime 未变：降级下钻时跳过该文件夹，不再打探。
+do
+    local dav = fakeDav()
+    dav.infinity_error = "WebDAV 请求失败（HTTP 403）"
+    dav.dir_mtime = 1700000000
+    dav:put(ROOT .. "/第三牧场/第三牧场.epub", "x")
+    dav:put(ROOT .. "/新书/新书.epub", "x")
+    local cache = require("support.config").dir() .. "/webdav-dir-mtimes"
+    require("utils.paths").ensureDir(cache)
+    local c = client(dav)
+    function c:webdavCacheRoot() return cache end
+    Assert.is_true(refresh(c))
+    Assert.not_nil(books["webdav://第三牧场/第三牧场.epub"])
+    local first_new = dav:count("PROPFIND " .. ROOT .. "/新书")
+    Assert.is_true(first_new >= 1)
+    dav.calls = {}
+    dav.depths = {}
+    -- 新书已在书架且文件夹 mtime 不变，不应再进文件夹；根目录仍会列一次。
+    Assert.is_true(refresh(c))
+    Assert.eq(dav:count("PROPFIND " .. ROOT .. "/第三牧场"), 0, "已有且未改动则跳过")
+    Assert.eq(dav:count("PROPFIND " .. ROOT .. "/新书"), 0, "已有且未改动则跳过")
+    Assert.is_true(dav:count("PROPFIND " .. ROOT) >= 1)
+    books = {}
+end
+
+-- 单文件夹列举失败不中止整轮，其它书照收。
+do
+    local dav = fakeDav()
+    dav.infinity_shallow = true
+    dav.dir_mtime = 1700000001
+    dav:put(ROOT .. "/重试/旧书.epub", "x")
+    dav:put(ROOT .. "/重试/新书.epub", "x")
+    books["webdav://重试/旧书.epub"] = { stable_id = "webdav://重试/旧书.epub", deleted = 0, sync_status = 1 }
+    dav.fail = { [ROOT .. "/重试"] = "timeout" }
+    local c = client(dav)
+    Assert.is_true(refresh(c))
+    Assert.eq(books["webdav://重试/旧书.epub"].deleted, 0)
+    Assert.is_nil(books["webdav://重试/新书.epub"])
+    local first = dav:count("PROPFIND " .. ROOT .. "/重试")
+    dav.fail = nil
+    Assert.is_true(refresh(c))
+    Assert.eq(dav:count("PROPFIND " .. ROOT .. "/重试"), first + 1, "失败目录同 mtime 仍需重试")
+    Assert.not_nil(books["webdav://重试/新书.epub"])
+    books = {}
+end
+
+-- 下级目录失败时，父目录也不能被当成完整扫描而跳过。
+do
+    local dav = fakeDav()
+    dav.infinity_shallow = true
+    dav.dir_mtime = 1700000002
+    dav:put(ROOT .. "/父目录/旧书.epub", "x")
+    dav:put(ROOT .. "/父目录/子目录/新书.epub", "x")
+    books["webdav://父目录/旧书.epub"] = { stable_id = "webdav://父目录/旧书.epub", deleted = 0, sync_status = 1 }
+    dav.fail = { [ROOT .. "/父目录/子目录"] = "timeout" }
+    local c = client(dav)
+    Assert.is_true(refresh(c))
+    Assert.is_nil(books["webdav://父目录/子目录/新书.epub"])
+    dav.fail = nil
+    Assert.is_true(refresh(c))
+    Assert.not_nil(books["webdav://父目录/子目录/新书.epub"])
+    books = {}
+end
+
+-- 真正异步的并发目录请求：取消整轮取消全部在飞请求，不取消已完成的子请求。
+do
+    local dav = fakeDav()
+    local list = dav.listAsync
+    local pending, jobs = {}, {}
+    local c = client(dav)
+    local completed
+    function dav:listAsync(path, cb, opts)
+        local job = { cancelled = 0 }
+        function job:cancel() self.cancelled = self.cancelled + 1 end
+        jobs[path] = job
+        pending[path] = function()
+            if path == ROOT then
+                cb({
+                    { name = "a", path = ROOT .. "/a", is_dir = true },
+                    { name = "b", path = ROOT .. "/b", is_dir = true },
+                    { name = "c", path = ROOT .. "/c", is_dir = true },
+                })
+            else
+                list(self, path, cb, opts)
+            end
+        end
+        return job
+    end
+    local handle = c:scanWebdavAsync(function() completed = true end, { refresh = true })
+    pending[ROOT]()
+    Assert.not_nil(jobs[ROOT .. "/a"])
+    Assert.not_nil(jobs[ROOT .. "/b"])
+    Assert.not_nil(jobs[ROOT .. "/c"])
+    pending[ROOT .. "/a"]()
+    handle:cancel()
+    Assert.eq(jobs[ROOT .. "/a"].cancelled, 0, "已完成句柄应移除")
+    Assert.eq(jobs[ROOT .. "/b"].cancelled, 1)
+    Assert.eq(jobs[ROOT .. "/c"].cancelled, 1)
+    pending[ROOT .. "/b"]()
+    pending[ROOT .. "/c"]()
+    Assert.is_nil(completed, "取消后的迟到回调不得完成同步")
+    dav.listAsync = list
+    Assert.is_true(scan(c), "取消后书目串行队列必须放行")
+    books = {}
+end
+
+do
+    local dav = fakeDav()
+    dav.infinity_error = "WebDAV 请求失败（HTTP 403）"
+    dav.fail = { [ROOT .. "/坏掉的书"] = "Request timed out after 45 secs" }
+    dav:put(ROOT .. "/坏掉的书/坏掉的书.epub", "x")
+    dav:put(ROOT .. "/完好的书/完好的书.epub", "x")
+    local ok, err = refresh(client(dav))
+    Assert.is_true(ok)
+    Assert.is_nil(err)
+    Assert.not_nil(books["webdav://完好的书/完好的书.epub"])
+    Assert.is_nil(books["webdav://坏掉的书/坏掉的书.epub"], "失败的文件夹跳过")
     books = {}
 end
 

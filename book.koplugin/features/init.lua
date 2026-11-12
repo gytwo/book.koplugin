@@ -133,6 +133,7 @@ Features.list = {
     "battery", -- onSuspend/onResume/Charging：用法统计累计；设置页只靠约定文件也能出现，进 list 才有钩子
     "subscribe",
     "cookie",
+    "notes",
     "wechat_import",
     "extensions",
     "quickui_vb",
@@ -161,8 +162,23 @@ function Features.load()
     Features.registerConventions()
 end
 
+--- 丢掉目录扫描缓存：插件目录被替换后（在线更新装好、尚未重启）要重新认约定文件。
+function Features.invalidateScan()
+    scanned = {}
+end
+
 --- 约定文件代登记（load 的第 2、3 步；单测只要设置 / 顶栏条目时也可单独调）。
+--- 可重复调用：先清掉本加载器登过的 setting.entries / topbar.items，再按当前磁盘重登。
+--- reader.ready 只挂一次，避免重复 emit。
+local conventions_ready = false
 function Features.registerConventions()
+    Features.invalidateScan()
+    Ext.removeWhere("setting.entries", function(item)
+        return type(item) == "table" and type(item.name) == "string" and type(item.entries) == "function"
+    end)
+    Ext.removeWhere("topbar.items", function(item)
+        return type(item) == "function"
+    end)
     for _idx, name in ipairs(Features.scan("setting")) do
         if Features.module(name, "setting").entries then
             Ext.add("setting.entries", { name = name, entries = function(desktop)
@@ -173,7 +189,42 @@ function Features.registerConventions()
     for _idx, name in ipairs(Features.scan("topbar")) do
         Ext.add("topbar.items", function() return Features.module(name, "topbar").items() end)
     end
-    Ext.add("reader.ready", function(plugin) Features.emit("onReaderReady", plugin) end)
+    if not conventions_ready then
+        Ext.add("reader.ready", function(plugin) Features.emit("onReaderReady", plugin) end)
+        -- 下层通过扩展点触发，勿在 desktop/utils 里 require("features")。
+        Ext.add("setting.before_groups", function(root) Features.refreshIfStale(root) end)
+        Ext.add("desktop.plugin_installed", function(root) Features.refreshIfStale(root) end)
+        conventions_ready = true
+    end
+end
+
+--- 磁盘上的 bookversion 与内存不一致时（更新已换目录、进程还没重启）：重建模块索引并重登约定文件。
+--- 设置页打开前调用，让新 feature（如壁纸）不必等整机重启才出现。
+---@param plugin_root string|nil
+---@return boolean refreshed
+function Features.refreshIfStale(plugin_root)
+    local root = plugin_root
+    if not root or root == "" then
+        root = DIR and DIR:match("^(.*)/features$") or nil
+    end
+    if not root then return false end
+    local disk = loadfile(root .. "/bookversion.lua")
+    if not disk then return false end
+    local ok, version = pcall(disk)
+    if not ok or type(version) ~= "string" then return false end
+    local mem_ok, mem = pcall(require, "bookversion")
+    if mem_ok and mem == version then return false end
+    require("utils.modules").refresh(root)
+    -- 清掉已加载的 feature 约定模块，让下次 require 读新文件。
+    for name, _ in pairs(package.loaded) do
+        if type(name) == "string" and name:match("^features%.") then
+            package.loaded[name] = nil
+        end
+    end
+    package.loaded["bookversion"] = nil
+    Features.registerConventions()
+    require("utils.log").info("features refreshed after update", version)
+    return true
 end
 
 ---@param hook string

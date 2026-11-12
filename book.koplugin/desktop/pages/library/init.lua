@@ -217,6 +217,26 @@ function Library:closeGroup()
     self.desktop:updateView()
 end
 
+--- 返回键：分组下钻退回列表；文件夹非根退上级。根页返回 false 让桌面吞掉。
+---@return boolean
+function Library:onBack()
+    local g = self:currentGroup()
+    if g.key and not self:inGroupList() then
+        self:closeGroup()
+        return true
+    end
+    if g.id == "folder" then
+        local root = localRoot()
+        local dir = self:currentDir()
+        if dir ~= root then
+            local parent = dir:match("^(.*)/[^/]+$")
+            self:openDir(parent and #parent > #root and parent or nil)
+            return true
+        end
+    end
+    return false
+end
+
 --- 网格 / 列表互切，尽量停在原来第一本书所在页。
 function Library:toggleView()
     local first = (self.page - 1) * self.page_size
@@ -702,6 +722,17 @@ function Library:build(ctx, state, opts)
     })
 end
 
+--- 书架刷新按钮：单击增量，长按全量。
+---@param library BookLibrary
+---@return BookThemeButton
+local function refreshButton(library)
+    return Button:new{
+        icon = "refresh", variant = "ghost", size = "small",
+        callback = function() library:rescan(false) end,
+        hold_callback = function() library:rescan(true) end,
+    }
+end
+
 --- 书籍视图的工具条右侧：排序、筛选、视图切换、搜索、刷新，搜索中再加清除。
 ---@return table[]
 function Library:bookTools(compact)
@@ -733,7 +764,7 @@ function Library:bookTools(compact)
             callback = function() self:toggleView() end,
         },
         Button:new{ icon = "search", variant = "ghost", size = "small", callback = function() self:showSearch() end },
-        Button:new{ icon = "refresh", variant = "ghost", size = "small", callback = function() self:rescan() end },
+        refreshButton(self),
     }
     if self.total > 0 and MoonSettings.get("ui").library_random then
         table.insert(tools, 3, Button:new{
@@ -771,7 +802,7 @@ function Library:buildPage(ctx)
         local left = { Text.line("caption", T(_("共%1"), groups and #groups.rows or 0), muted) }
         local right = {
             Button:new{ icon = "search", variant = "ghost", size = "small", callback = function() self:showSearch() end },
-            Button:new{ icon = "refresh", variant = "ghost", size = "small", callback = function() self:rescan() end },
+            refreshButton(self),
         }
         local body
         if groups and #groups.rows > 0 then
@@ -882,7 +913,7 @@ function Library:buildPage(ctx)
     if g.id == "folder" then
         right = {
             Button:new{ icon = "search", variant = "ghost", size = "small", callback = function() self:showSearch() end },
-            Button:new{ icon = "refresh", variant = "ghost", size = "small", callback = function() self:rescan() end },
+            refreshButton(self),
         }
     end
     return frame(w, h, { tabs, toolbar(w, m.top_h, left, right) }, body, m.grid_h, pager)
@@ -1055,13 +1086,14 @@ function Library:gotoPage(page)
     self.desktop:updateView()
 end
 
---- 手动强制刷新书库；具体动作由当前源决定（本地源扫盘，远端源拉全量）。
+--- 手动刷新书库。force 为真时全量，否则增量；源不支持同步时直接返回。
 --- 进度弹窗归任务队列：源把刷新入队并前台跟随，刷新中再点只重新弹出进度。
-function Library:rescan()
+---@param force boolean|nil
+function Library:rescan(force)
     local source = self.desktop.source
     if not source or not source.syncBooksAsync then return end
     self:verifyDownloads()
-    require("desktop.sync").refresh(self.desktop)
+    require("desktop.sync").refresh(self.desktop, force == true)
 end
 
 --- 后台校验已下载标记（文件可能被手动删掉），撤掉了登记且仍在图书馆就重拉当前页。

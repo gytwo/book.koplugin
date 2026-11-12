@@ -25,6 +25,66 @@ local _ = require("gettext")
 
 local Store = {}
 
+--- 包括已不在书库里的阅读记录；清索引后仍能凭身份找到本地原书与工作目录。
+---@param source_id string
+---@param opts BookDataCleanup
+---@return table<string, boolean>|nil
+local function readingPaths(source_id, opts)
+    for _idx, name in ipairs({ "book.progress_db", "book.note_db", "book.stats_db" }) do require(name) end
+    local paths, ids = {}, {}
+    local where, args = DB.identityClause(source_id, opts.stable_prefix, opts.exclude)
+    local ok = DB.each([[
+        SELECT stable_id, path FROM (
+            SELECT source_id, stable_id, path FROM books
+            UNION SELECT source_id, stable_id, path FROM chapters
+            UNION SELECT source_id, stable_id, NULL FROM pending_progress
+            UNION SELECT source_id, stable_id, NULL FROM notes
+            UNION SELECT source_id, stable_id, NULL FROM reading_stats
+        ) WHERE stable_id<>'' AND ]] .. where .. ";", args, function(row)
+        ids[row[1]] = true
+        if row[2] and row[2] ~= "" then paths[row[2]] = true end
+        if source_id == "local" and row[1]:sub(1, 9) ~= "webdav://" then paths[row[1]] = true end
+    end)
+    if not ok then return nil end
+    local lfs = require("libs/libkoreader-lfs")
+    local function walk(dir)
+        for name in lfs.dir(dir) do
+            if name ~= "." and name ~= ".." then
+                local path = dir .. "/" .. name
+                local mode = lfs.symlinkattributes(path, "mode")
+                if mode == "directory" and name:sub(-4) == ".sdr" then
+                    for file in lfs.dir(path) do
+                        local suffix = file:match("^metadata%.(.+)%.lua$") or file:match("^metadata%.(.+)%.lua%.old$")
+                        if suffix then paths[path:sub(1, -5) .. "." .. suffix] = true end
+                    end
+                elseif mode == "directory" then walk(path)
+                elseif mode == "file" then paths[path] = true end
+            end
+        end
+    end
+    for stable_id in pairs(ids) do
+        local dir = Paths.bookWorkDir(stable_id, source_id)
+        if lfs.symlinkattributes(dir, "mode") == "directory" then walk(dir) end
+    end
+    return paths
+end
+
+--- 只清本机记录，原书和下载文件不动；文件系统失败时不继续删库，调用方提示重试。
+---@param source_id string
+---@param opts BookDataCleanup
+---@return boolean
+function Store.clearSourceData(source_id, opts)
+    assert(opts.books or opts.reading, "no data selected")
+    if opts.reading then
+        local paths = readingPaths(source_id, opts)
+        if not paths then return false end
+        for path in pairs(paths) do
+            if not require("book.sidecar").clearReading(path) then return false end
+        end
+    end
+    return BookDB.clearSourceData(source_id, opts)
+end
+
 --- 保存列表中的书籍元数据；没有身份列的临时条目跳过。
 ---@param books table
 function Store.rememberMany(books)
@@ -188,12 +248,31 @@ function Store.forgetWebdav()
     return true
 end
 
---- 换本地书库目录：旧根下、新根外的纯本地书整本撕掉（书架 / 进度 / 笔记 / 统计 / 缓存）。
+--- 换本地书库目录：旧根下、新根外的纯本地书先收成待重匹配；无法再匹配的墓碑整本撕掉并清缓存。
 ---@param old_root string|nil
 ---@param new_root string|nil
 ---@return boolean
-function Store.forgetOldRoot(old_root, new_root)
-    local ok, ids = BookDB.forgetOldRoot("local", old_root, new_root)
+function Store.stashOldRoot(old_root, new_root)
+    local ok, ids = BookDB.stashOldRoot("local", old_root, new_root)
+    if not ok then return false end
+    purgeForgotten("local", ids)
+    return true
+end
+
+--- 扫盘后：待重匹配行里文件已经不在盘上、且没被 md5 收编的，整本撕掉并清缓存。
+---@return boolean
+function Store.forgetUnmatchedRelocated()
+    local lfs = require("libs/libkoreader-lfs")
+    local gone = {}
+    for _idx, stable_id in ipairs(BookDB.relocatingIds("local")) do
+        local row = BookDB.get("local", stable_id)
+        local path = row and (row.path or row.stable_id)
+        if not path or not lfs.attributes(path, "mode") then
+            gone[#gone + 1] = stable_id
+        end
+    end
+    if #gone == 0 then return true end
+    local ok, ids = BookDB.forgetMany("local", gone)
     if not ok then return false end
     purgeForgotten("local", ids)
     return true

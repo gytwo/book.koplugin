@@ -430,36 +430,37 @@ Assert.eq(cleared[2], "w2", "缓存结束后可清理")
 -- 选择缓存范围：起点取本地进度；全本不带 range，到结尾不带 count，往后 N 章带 count。
 local pending = { chapter_idx = 7, fraction = 0.2 }
 package.loaded["book.progress_db"] = { get = function() return pending end }
-local function pickCache(row, col)
+package.loaded["book.review_prefetch"] = { supported = function() return false end }
+local function pickCache(kind)
     page:chooseCacheRange()
-    local sheet = Themed.last("sheet")
-    Assert.eq(sheet.title, "缓存章节")
-    local item = sheet.items[row]
-    if col then item = item.buttons[col] end
-    item.callback()
+    local settings = Themed.last("settings")
+    Assert.eq(settings.title, "缓存章节")
+    local items = settings.items(settings)
+    Assert.eq(items[1].title, "缓存范围")
+    local before = #cache_calls
+    items[1].on_select(kind)
+    Assert.eq(#cache_calls, before, "选范围不入队")
+    settings.buttons(settings)[2].callback()
     local call = cache_calls[#cache_calls]
     call.cb(true, 1, nil, 1, 0)
-    return call.range, item.text
+    return call.range
 end
-local range, label = pickCache(1)
-Assert.eq(label, "全本缓存")
-Assert.is_nil(range)
-range, label = pickCache(2)
-Assert.eq(label, "从当前进度缓存到结尾")
+Assert.is_nil(pickCache("all"))
+local range = pickCache("end")
 Assert.eq(range.chapter_idx, 7)
 Assert.eq(range.fraction, 0.2)
 Assert.is_nil(range.count)
-for _idx, case in ipairs({ { 3, 1, 10 }, { 3, 2, 20 }, { 4, 1, 50 }, { 4, 2, 100 } }) do
-    range, label = pickCache(case[1], case[2])
-    Assert.eq(label, "往后 " .. case[3] .. " 章")
+for _, n in ipairs({ 5, 10, 50, 100, 200 }) do
+    range = pickCache(tostring(n))
     Assert.eq(range.chapter_idx, 7)
-    Assert.eq(range.count, case[3])
+    Assert.eq(range.count, n)
 end
 pending = nil
-range = pickCache(3, 1)
-Assert.is_nil(range.chapter_idx, "无进度：从第 1 章起")
+range = pickCache("10")
+Assert.is_nil(range.chapter_idx, "无进度：不带起始章，由底层从第 1 章起")
 Assert.eq(range.count, 10)
 package.loaded["book.progress_db"] = nil
+package.loaded["book.review_prefetch"] = nil
 resolved = nil
 
 -- 整本下载：离线直接提示；在线入队，走属主源 openBookAsync 只落盘不开书，成功通知书架已变。
@@ -683,6 +684,54 @@ for _idx, text in ipairs(texts_w) do
 end
 desktop.detail[1]:paintTo(Kit.canvas(), 0, 0)
 desktop.detail:close()
+
+-- 未下载的 WebDAV 书：没有 path / book.format 时，从 stable_id 后缀显示格式；书名仍是词干，不把远端路径当路径行。
+local function info_texts(book)
+    Detail.open(desktop, "library", book)
+    local texts = Kit.texts(desktop.detail)
+    Assert.eq(desktop.detail.book.title, book.title, "书名仍是词干，不含后缀")
+    desktop.detail:close()
+    return texts
+end
+local function has_format(texts, label)
+    Assert.contains(texts, "格式")
+    Assert.contains(texts, label)
+    for _idx, text in ipairs(texts) do
+        Assert.is_true(not text:find("Some Book.", 1, true) and not text:find("webdav://", 1, true),
+            "不把带后缀文件名或远端路径当标题/路径：" .. text)
+    end
+end
+has_format(info_texts({
+    source_id = "local", stable_id = "webdav://Some Book.epub", title = "Some Book",
+}), "EPUB")
+has_format(info_texts({
+    source_id = "local", stable_id = "webdav://Some Book.mobi", title = "Some Book",
+}), "MOBI")
+has_format(info_texts({
+    source_id = "local", stable_id = "webdav://Some Book.txt", title = "Some Book",
+}), "TXT")
+
+-- 本地 path 的 fb2.zip 显示 FB2.ZIP，不会被当成 ZIP。
+texts_w = info_texts({
+    source_id = "local", stable_id = "/books/长书.fb2.zip", path = "/books/长书.fb2.zip", title = "长书",
+})
+Assert.contains(texts_w, "格式")
+Assert.contains(texts_w, "FB2.ZIP")
+Assert.contains(texts_w, "/books/长书.fb2.zip")
+for _idx, text in ipairs(texts_w) do
+    Assert.is_true(text ~= "ZIP", "fb2.zip 不当成 ZIP：" .. text)
+end
+
+-- 非书籍或没有后缀：不编造格式行。
+for _idx, book in ipairs({
+    { source_id = "local", stable_id = "webdav://notes.bin", title = "notes" },
+    { source_id = "local", stable_id = "webdav://NoExt", title = "NoExt" },
+}) do
+    texts_w = info_texts(book)
+    for _idx2, text in ipairs(texts_w) do
+        Assert.is_true(text ~= "格式" and text ~= "BIN", "非书籍后缀不显示格式：" .. text)
+    end
+end
 
 -- 全本书有简介：不再为简介预扣高度，刚好放下时路径还在；再矮则丢掉前面的行，路径留下。
 Detail.open(desktop, "library", {

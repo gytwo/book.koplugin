@@ -22,6 +22,15 @@ do
     locator = Annotations.fromWireOffset(wire, flow, 0)
     Assert.eq(locator, "/html/body/p/text()[1].0", "标签中的位置落到后续正文")
     Assert.eq(Annotations.toWirePosition(wire, flow, "/missing/text().0"), nil)
+    Assert.eq(Annotations.toWirePosition(wire, flow, "/body/DocFragment[1]/body/p/text()[1].12000"), 12015,
+        "DocFragment 外壳规范成本地 HTML 路径后再映射")
+    Assert.eq(Annotations.toWirePosition(wire, flow, "/body/DocFragment[1]/html/body/p/text()[1].12000"), 12015)
+    Assert.eq(Annotations.toWirePosition(wire, flow,
+        "/body[1]/DocFragment[1]/html[1]/body[1]/p[1]/text()[1].12000"), 12015,
+        "V1 [1] 下标与 toStringV2 路径对得上")
+    Assert.eq(Annotations.toWirePosition(wire, flow, "/html[1]/body[1]/p[1]/text()[1].12000"), 12015)
+    Assert.eq(select(4, Annotations.toWirePosition(wire, flow, "/html/body/div/text().0")),
+        "reading position not found in chapter", "真正缺失的路径仍失败")
 end
 
 do
@@ -42,6 +51,8 @@ do
     local expected = assert(html:find("图片后的正文", 1, true)) - 1
     Assert.eq(offset, expected, "图片位置映射到之后最近的可见正文")
     Assert.eq(summary, "图片后的正文")
+    Assert.eq(Annotations.toWirePosition(wire, flow, "/body/DocFragment[1]/body/div[1]/img.0"), expected)
+    Assert.eq(Annotations.toWirePosition(wire, flow, "/html[1]/body[1]/div[1]/img[1].0"), expected)
 
     local end_html = "<html><body><p>章节正文</p><img src=\"tail.jpg\"/></body></html>"
     local end_wire, end_flow = Annotations.wireMapping(end_html), Annotations.flow(end_html)
@@ -53,4 +64,48 @@ do
     local wire = Annotations.plainMapping("目标正文")
     local flow = Annotations.flow("<html><body><p>目标正文</p><p>目标正文</p></body></html>")
     Assert.eq(Annotations.fromWireOffset(wire, flow, 0), nil, "改写后重复次数不符不能随便挑一个")
+end
+
+do
+    -- CB_ 纯图章：无可见正文，locator 落在 <img> 上，必须映到 wire HTML 标签起始偏移。
+    local html = '<html><body>'
+        .. '<div><img src="a.jpg"/></div>'
+        .. '<div><img src="b.jpg"/></div>'
+        .. '<div><img src="c.jpg"/></div>'
+        .. '</body></html>'
+    local wire, flow = Annotations.wireMapping(html), Annotations.flow(html)
+    Assert.eq(flow.count, 0, "纯图章可见 rune 数为 0")
+    Assert.eq(wire.count, 0)
+    local offset, summary, fraction, err = Annotations.toWirePosition(
+        wire, flow, "/html/body/div[2]/img.0", html)
+    Assert.is_nil(err)
+    local expected = 0
+    do
+        local runes, i, len, seen = {}, 1, #html, 0
+        while i <= len do
+            local byte = html:byte(i)
+            local width = byte < 0x80 and 1 or byte < 0xe0 and 2 or byte < 0xf0 and 3 or 4
+            local rune = html:sub(i, i + width - 1)
+            if rune == "<" and html:sub(i, i + 3) == "<img" then
+                seen = seen + 1
+                if seen == 2 then
+                    expected = #runes
+                    break
+                end
+            end
+            runes[#runes + 1] = rune
+            i = i + width
+        end
+    end
+    Assert.eq(offset, expected, "第二张图的 <img> 在 wire HTML 上的 rune 偏移")
+    Assert.eq(summary, "")
+    Assert.is_true(fraction ~= nil and fraction > 0 and fraction < 1)
+    Assert.eq(Annotations.toWirePosition(wire, flow, "/body/DocFragment[1]/body/div[2]/img.0", html), expected,
+        "纯图章 DocFragment 前缀仍能映到 <img> 偏移")
+    Assert.eq(Annotations.toWirePosition(wire, flow, "/html[1]/body[1]/div[2]/img[1].0", html), expected)
+
+    Assert.eq(Annotations.toWirePosition(wire, flow, "/html/body/div[2]/img.0"), nil,
+        "没有 source 时纯图章不能瞎编偏移")
+    Assert.eq(select(4, Annotations.toWirePosition(wire, flow, "/html/body/div[9]/img.0", html)),
+        "reading position not found in chapter")
 end
