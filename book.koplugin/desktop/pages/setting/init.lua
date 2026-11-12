@@ -319,20 +319,19 @@ local GROUP_FOLDERS = {
         {
             id = "pages", icon = "dashboard", title = _("页面"),
             subtitle = _("图书馆、订阅、书城、统计"),
-            -- 订阅是 feature:subscribe:main；其余核心裸 id。
             match = { "library", "feature:subscribe", "store", "insight" },
         },
         {
             id = "actions", icon = "dashboard_customize", title = _("快捷面板"),
             subtitle = _("桌面快捷开关"),
-            match = { "feature:panel" },
+            match = { "panel_desktop" },
         },
     },
     reader = {
         {
             id = "ui", icon = "touch_app", title = _("阅读界面"),
             subtitle = _("行为、栏、侧栏、翻页、快捷面板与段评"), default = true,
-            -- 段评是页内标记，跟栏/侧栏一类；未列在其它类的（字体映射、翻页动画等）也归这里。
+            match = { "feature:panel", "panel_reader" },
         },
         {
             id = "lookup", icon = "format_ink_highlighter", title = _("划词与词典"),
