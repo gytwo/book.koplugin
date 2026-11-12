@@ -15,6 +15,7 @@ local JSON = require("json")
 local NoteDB = require("book.note_db")
 local logger = require("utils.log")
 local Normalize = require("book.note.normalize")
+local Text = require("utils.text")
 
 local Note = {}
 local last_revision = 0
@@ -34,10 +35,14 @@ end
 ---@param total_pages integer|nil
 ---@return table[]
 function Note.clean(source, items, total_pages)
+    local cleaned
     if source and type(source.cleanAnnotations) == "function" then
-        return source:cleanAnnotations(items, total_pages)
+        cleaned = source:cleanAnnotations(items, total_pages)
+    else
+        cleaned = Normalize.clean(items, total_pages)
     end
-    return Normalize.clean(items, total_pages)
+    -- 源自己的清洗也可能漏掉历史重复；落库前再折叠一次，避免脏快照被原样写回。
+    return (Normalize.unique(cleaned))
 end
 
 --- 远端注解按 ``chapter_idx`` 分片落库；完整快照状态存于 payload 外层元数据。
@@ -160,6 +165,7 @@ end
 ---@return { cancel: fun() }
 local function runSyncAsync(source, opts, cb)
     opts = opts or {}
+    local current = require("source.auth").currentAccount(source.id)
     local target = opts.identity and opts.identity.stable_id or "all"
     local can_pull = type(source.pullNotesAsync) == "function"
     local can_push = type(source.pushNotesAsync) == "function"
@@ -222,6 +228,7 @@ local function runSyncAsync(source, opts, cb)
     --- 串行推进（每步在回调里递归），避免同时对同一本书发多个请求。
     local function nextIdentity()
         if cancelled then return end
+        if not current() then finish(nil, "source account changed"); return end
         local identity = identities[index]
         index = index + 1
         if not identity then finish(result); return end
@@ -239,6 +246,7 @@ local function runSyncAsync(source, opts, cb)
             current_job = source:pullNotesAsync(identity, function(annotations, err, meta)
                 current_job = nil
                 if cancelled then return end
+                if not current() then finish(nil, "source account changed"); return end
                 if type(annotations) ~= "table" then finish(nil, err or "notes pull failed"); return end
                 book_pulled[stable_id] = true
                 saveRemoteBuckets(source, stable_id, annotations,
@@ -263,47 +271,78 @@ local function runSyncAsync(source, opts, cb)
                 finish(nil, "invalid local notes")
                 return
             end
-            current_job = source:pushNotesAsync(identity, annotations, function(value, err, data)
-                current_job = nil
-                if cancelled then return end
-                if not value then
-                    if opts.dirty_only then
-                        result.push_error = err or "notes push failed"
-                        logger.warn("book.note push failed; keep dirty", source.id, identity.stable_id, result.push_error)
-                        nextIdentity()
+            if row.account_pending == 1 then
+                local book = require("book.books_db").shelfBook(source, identity.stable_id)
+                if book and book.deleted == 1 and book.sync_status == 1 then
+                    logger.dbg("book.note transfer kept locally: not on new shelf", source.id, identity.stable_id)
+                    if not NoteDB.markSynced(source.id, identity.stable_id, identity.chapter_idx, row.updated_at) then
+                        finish(nil, "failed to retain local notes")
                         return
                     end
-                    result.conflicts = result.conflicts + 1
-                    if can_pull then
-                        pullRemote()
-                    else
-                        finish(nil, err or "notes push failed")
+                    return nextIdentity()
+                end
+            end
+            local function push()
+                current_job = source:pushNotesAsync(identity, annotations, function(value, err, data)
+                    current_job = nil
+                    if cancelled then return end
+                    if not current() then finish(nil, "source account changed"); return end
+                    if not value then
+                        if opts.dirty_only then
+                            result.push_error = err or "notes push failed"
+                            logger.warn("book.note push failed; keep dirty", source.id, identity.stable_id, result.push_error)
+                            nextIdentity()
+                            return
+                        end
+                        result.conflicts = result.conflicts + 1
+                        if can_pull then
+                            pullRemote()
+                        else
+                            finish(nil, err or "notes push failed")
+                        end
+                        return
                     end
-                    return
-                end
-                -- 源侧可在上传过程中原地回填远端标识，必须把回填后的快照落库，
-                -- 否则下轮会重复上传。
-                local clean = Note.clean(source, annotations)
-                local ok_encode, pushed_payload = pcall(JSON.encode, clean)
-                if not ok_encode then
-                    finish(nil, "invalid local notes")
-                    return
-                end
-                local confirmed, stale = confirm(row, pushed_payload)
-                if stale then
-                    -- 上传期间本地又改过：这次算推成功，但脏标记留着下轮再推
-                    logger.dbg("book.note confirm skipped: local changed during push", row.stable_id)
-                elseif not confirmed then
-                    finish(nil, "notes confirm failed")
-                    return
-                end
-                -- 源如实回报这轮推了几条（对账后无可推是 0）；老源没有 data，按「推了一条」记。
-                result.pushed = result.pushed + (type(data) == "table" and tonumber(data.pushed) or 1)
-                if type(data) == "table" and tonumber(data.conflicts) then
-                    result.conflicts = result.conflicts + tonumber(data.conflicts)
-                end
-                pullRemote()
-            end)
+                    -- 源侧可在上传过程中原地回填远端标识，必须把回填后的快照落库，
+                    -- 否则下轮会重复上传。
+                    local clean = Note.clean(source, annotations)
+                    local ok_encode, pushed_payload = pcall(JSON.encode, clean)
+                    if not ok_encode then
+                        finish(nil, "invalid local notes")
+                        return
+                    end
+                    local confirmed, stale = confirm(row, pushed_payload)
+                    if stale then
+                        -- 上传期间本地又改过：这次算推成功，但脏标记留着下轮再推
+                        logger.dbg("book.note confirm skipped: local changed during push", row.stable_id)
+                    elseif not confirmed then
+                        finish(nil, "notes confirm failed")
+                        return
+                    end
+                    -- 源如实回报这轮推了几条（对账后无可推是 0）；老源没有 data，按「推了一条」记。
+                    result.pushed = result.pushed + (type(data) == "table" and tonumber(data.pushed) or 1)
+                    if type(data) == "table" and tonumber(data.conflicts) then
+                        result.conflicts = result.conflicts + tonumber(data.conflicts)
+                    end
+                    pullRemote()
+                end)
+            end
+            -- 换号不是删除：整本覆盖接口先合入新账号快照；自带逐条对账的源自行处理。
+            if (row.account_pending or 0) > 0 and can_pull
+                and type(source.resetAccountAnnotations) ~= "function" then
+                current_job = source:pullNotesAsync(identity, function(remote, err)
+                    current_job = nil
+                    if cancelled then return end
+                    if not current() then finish(nil, "source account changed"); return end
+                    if not remote then finish(nil, err or "notes pull failed"); return end
+                    local paging = type(annotations[1] and annotations[1].page) == "number"
+                    local merged = Normalize.merge(remote, annotations, paging)
+                    if #merged < #annotations then finish(nil, "invalid local notes"); return end
+                    annotations = merged
+                    push()
+                end)
+            else
+                push()
+            end
             return
         end
         pullRemote()
@@ -315,7 +354,34 @@ local function runSyncAsync(source, opts, cb)
         end }
 end
 
+---@class NoteSyncTask
+---@field source BookSource
+---@field opts table|nil
+---@field cb function|nil
+---@field cancelled boolean
+---@field current fun(): boolean
+---@field job { cancel: fun() }|nil
+---@field done boolean|nil
+
+---@class NoteSyncQueue
+---@field items NoteSyncTask[]
+---@field running NoteSyncTask|nil
+
+---@type table<string, NoteSyncQueue>
 local sync_queues = {}
+
+---@param source_id string
+function Note.abortSource(source_id)
+    local queue = sync_queues[source_id]
+    if not queue then return end
+    sync_queues[source_id] = nil
+    for _idx, task in ipairs(queue.items) do task.cancelled = true end
+    local running = queue.running
+    if running then
+        running.cancelled = true
+        if running.job then running.job:cancel() end
+    end
+end
 
 --- 同一数据源的注解同步严格串行，避免两个快照同时创建同一条远端注解。
 ---@param source BookSource
@@ -326,26 +392,27 @@ function Note.syncAsync(source, opts, cb)
     local key = source.id
     local queue = sync_queues[key]
     if not queue then
-        queue = { running = false, items = {} }
+        queue = { items = {} }
         sync_queues[key] = queue
     end
-    local task = { source = source, opts = opts, cb = cb, cancelled = false }
+    local task = { source = source, opts = opts, cb = cb, cancelled = false,
+        current = require("source.auth").currentAccount(source.id) }
     queue.items[#queue.items + 1] = task
 
     local function startNext()
         if queue.running then return end
         local next_task = table.remove(queue.items, 1)
-        while next_task and next_task.cancelled do
+        while next_task and (next_task.cancelled or not next_task.current()) do
             next_task = table.remove(queue.items, 1)
         end
         if not next_task then
-            sync_queues[key] = nil
+            if sync_queues[key] == queue then sync_queues[key] = nil end
             return
         end
-        queue.running = true
+        queue.running = next_task
         next_task.job = runSyncAsync(next_task.source, next_task.opts, function(result, err)
             next_task.done = true
-            queue.running = false
+            queue.running = nil
             if not next_task.cancelled and next_task.cb then next_task.cb(result, err) end
             startNext()
         end)
@@ -358,10 +425,242 @@ function Note.syncAsync(source, opts, cb)
             if task.job and task.job.cancel then
                 task.job:cancel()
                 task.job = nil
-                queue.running = false
+                queue.running = nil
                 startNext()
             end
         end }
 end
+
+
+--- 分页文档的 pos 是 {x,y,page} 表，tostring 只得到地址，不能当键。
+---@param pos any
+---@return string
+local function posKey(pos)
+    if type(pos) == "table" then
+        return tostring(pos.page) .. "," .. tostring(pos.x) .. "," .. tostring(pos.y)
+    end
+    return tostring(pos or "")
+end
+
+--- 一条注解在所属快照内的身份：优先源侧 id，否则用内容坐标。
+---@param item table
+---@return string
+local function itemId(item)
+    if item.wr_bookmark_id then
+        return "wr:" .. tostring(item.wr_bookmark_id)
+    end
+    if item.kavita_id then
+        return "kv:" .. tostring(item.kavita_id)
+    end
+    local id = item.id or item.annotation_id
+    if id ~= nil then
+        return "id:" .. tostring(id)
+    end
+    return table.concat({
+        "p",
+        tostring(item.text or ""),
+        tostring(item.page or ""),
+        posKey(item.pos0),
+        posKey(item.pos1),
+        tostring(item.datetime or ""),
+    }, "\0")
+end
+
+local function b64url(data)
+    local Text = require("utils.text")
+    return (Text.base64Encode(data):gsub("%+", "-"):gsub("/", "_"):gsub("=", ""))
+end
+
+local function unb64url(s)
+    s = s:gsub("-", "+"):gsub("_", "/")
+    local pad = (4 - #s % 4) % 4
+    if pad > 0 then s = s .. string.rep("=", pad) end
+    return require("utils.text").base64Decode(s)
+end
+
+--- 远程管理等用的跨书条目键（不落库）：source + 书 + 章 + 条目标识，URL 安全。
+---@param source_id string
+---@param stable_id string
+---@param chapter_idx integer|nil
+---@param item table
+---@return string
+function Note.itemKey(source_id, stable_id, chapter_idx, item)
+    local raw = table.concat({
+        tostring(source_id or ""),
+        tostring(stable_id or ""),
+        tostring(tonumber(chapter_idx) or 0),
+        itemId(item),
+    }, "\31")
+    return b64url(raw)
+end
+
+--- 解开 Note.itemKey。非法输入返回 nil。
+---@param key string
+---@return { source_id: string, stable_id: string, chapter_idx: integer, item_id: string }|nil
+function Note.parseItemKey(key)
+    if type(key) ~= "string" or key == "" then
+        return nil
+    end
+    local ok, raw = pcall(unb64url, key)
+    if not ok or type(raw) ~= "string" then
+        return nil
+    end
+    local source_id, stable_id, idx, item_id = raw:match("^(.-)\31(.-)\31(.-)\31(.*)$")
+    if not source_id or item_id == nil or item_id == "" then
+        return nil
+    end
+    return {
+        source_id = source_id,
+        stable_id = stable_id,
+        chapter_idx = tonumber(idx) or 0,
+        item_id = item_id,
+    }
+end
+
+---@param item table
+---@return table
+local function copyItem(item)
+    local out = {}
+    for k, v in pairs(item) do
+        out[k] = v
+    end
+    return out
+end
+
+--- 当前阅读器若正打开同一书/章，把改动写进内存注解和 sidecar，避免下次保存把远程改动盖掉。
+---@param source_id string
+---@param stable_id string
+---@param chapter_idx integer
+---@param item_id string
+---@param note string|nil
+---@param remove boolean
+local function patchOpenDocument(source_id, stable_id, chapter_idx, item_id, note, remove)
+    local ok_ui, ReaderUI = pcall(require, "apps/reader/readerui")
+    if not ok_ui or not ReaderUI or not ReaderUI.instance then
+        return
+    end
+    local ui = ReaderUI.instance
+    local ok_sess, Session = pcall(require, "reader.session")
+    local identity = ok_sess and Session and Session._snapshot and Session._snapshot.identity
+    if not identity then
+        return
+    end
+    if identity.source_id ~= source_id or identity.stable_id ~= stable_id then
+        return
+    end
+    if (tonumber(identity.chapter_idx) or 0) ~= chapter_idx then
+        return
+    end
+    local live = ui.annotation and ui.annotation.annotations
+    if type(live) ~= "table" then
+        return
+    end
+    if remove then
+        for i = #live, 1, -1 do
+            if type(live[i]) == "table" and itemId(live[i]) == item_id then
+                table.remove(live, i)
+            end
+        end
+    else
+        for _idx, item in ipairs(live) do
+            if type(item) == "table" and itemId(item) == item_id then
+                item.note = note
+            end
+        end
+    end
+    if ui.doc_settings then
+        ui.doc_settings:saveSetting("annotations", live)
+        if ui.doc_settings.flush then
+            ui.doc_settings:flush()
+        end
+    end
+    if ui.annotation and type(ui.annotation.updateAnnotations) == "function" then
+        ui.annotation:updateAnnotations(true)
+    end
+end
+
+local function maybePushDirty(source_id)
+    local ok_net, NetworkMgr = pcall(require, "ui/network/manager")
+    if not ok_net or not NetworkMgr or not NetworkMgr:isConnected() then
+        return
+    end
+    local ok_reg, Registry = pcall(require, "source.registry")
+    if not ok_reg or not Registry then
+        return
+    end
+    local source = Registry.resolve(source_id)
+    if source and type(source.pushNotesAsync) == "function" and type(source.pushDirty) == "function" then
+        source:pushDirty()
+    end
+end
+
+--- 改一条注解的备注，或从快照里删掉它。
+--- 走与阅读器保存相同的清洁 / 源侧墓碑（prepareLocalAnnotations）路径，再脏写 notes 表。
+--- 不修改 text / pos0 / pos1 / page，也不新建条目。
+---@param opts { key: string, note?: string|nil, remove?: boolean }
+---@return boolean ok
+---@return string|nil err
+function Note.mutate(opts)
+    opts = opts or {}
+    local parsed = Note.parseItemKey(opts.key)
+    if not parsed then
+        return false, "invalid key"
+    end
+    local source_id, stable_id, chapter_idx = parsed.source_id, parsed.stable_id, parsed.chapter_idx
+    local row = NoteDB.get(source_id, stable_id, chapter_idx)
+    if not row then
+        return false, "not found"
+    end
+    local previous, authoritative = Normalize.decode(row.payload)
+    if not previous then
+        return false, "invalid snapshot"
+    end
+    local new_note = type(opts.note) == "string" and Text.trim(opts.note) or nil
+    if opts.remove or new_note == "" then new_note = nil end
+    local found, deleted
+    local current = {}
+    for _idx, item in ipairs(previous) do
+        if type(item) == "table" and itemId(item) == parsed.item_id
+            and not item.wr_deleted and not item.kavita_deleted then
+            found = item
+            if opts.remove then
+                deleted = copyItem(item)
+            else
+                local copy = copyItem(item)
+                copy.note = new_note
+                current[#current + 1] = copy
+            end
+        else
+            current[#current + 1] = copyItem(item)
+        end
+    end
+    if not found then
+        return false, "not found"
+    end
+    local source, source_err = require("source.registry").resolve(source_id)
+    if not source then
+        logger.warn("book.note mutate source unavailable", source_id, source_err)
+        return false, source_err or "source unavailable"
+    end
+    local total_pages = found.total_pages
+    local clean = Note.clean(source, current, total_pages)
+    if source and type(source.prepareLocalAnnotations) == "function" then
+        source:prepareLocalAnnotations(previous, clean, deleted)
+    end
+    local ok, payload = pcall(JSON.encode, Normalize.pack(clean, authoritative))
+    if not ok then
+        logger.warn("book.note mutate encode failed", stable_id, payload)
+        return false, "encode failed"
+    end
+    local updated_at = Note.nextRevision()
+    if not NoteDB.upsert(source_id, stable_id, chapter_idx, payload, updated_at) then
+        logger.warn("book.note mutate save failed", stable_id)
+        return false, "save failed"
+    end
+    patchOpenDocument(source_id, stable_id, chapter_idx, parsed.item_id, new_note, opts.remove == true)
+    maybePushDirty(source_id)
+    return true
+end
+
 
 return Note

@@ -16,7 +16,7 @@ Setting.defaults = {
     },
     quick_panel_brightness = true,
     quick_panel_warmth = true,
-    quick_panel_reader_actions = { "toc", "font", "reflow", "highlights", "bookorbit", "xray", "page_turn", "settings" },
+    quick_panel_reader_actions = { "toc", "auto_toc", "font", "reflow", "highlights", "cache", "bookorbit", "xray", "page_turn", "settings" },
     show_desktop_tab = true,
     show_reader_tab = true,
 }

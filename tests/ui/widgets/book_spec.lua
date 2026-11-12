@@ -104,7 +104,7 @@ package.preload["ui.themes"] = function()
                 color = { ink = 1, page = 0, muted = 2, faint = 3, accent = 0x7038A0, headings = 0x7038A0 },
                 -- 模拟 soft：image 半径 0、raised 有圆角；无阴影封面须继承 raised.radius。
                 image = { bg = 0xEE, border = 0, border_color = 0xEE, radius = 0, shadow = 0, shadow_color = 0xDD },
-                raised = { bg = 0xEE, border = 0, border_color = 0xEE, radius = 12, shadow = 2, shadow_color = 0xDD },
+                raised = { bg = 0xEE, border = 0, border_color = 0xEE, radius = 6, shadow = 2, shadow_color = 0xDD },
                 space = { xs = 4, sm = 8 },
                 control = { icon = 22 },
                 font = { caption = 11 },
@@ -169,6 +169,13 @@ package.preload["ffi/blitbuffer"] = function()
     }
 end
 package.preload["gettext"] = function() return function(s) return s end end
+local ui_conf = { library_cover_radius = "theme" }
+package.preload["utils.settings"] = function()
+    return {
+        get = function() return ui_conf end,
+        save = function(_, values) ui_conf = values end,
+    }
+end
 
 package.loaded["ui.widgets.book"] = nil
 local Book = require("ui.widgets.book")
@@ -272,11 +279,21 @@ Assert.eq(opening.overlap_offset[2], math.floor((120 - 22) / 2))
 
 local bare = select(1, Book.cover(nil, nil, {}, 80, 120, {}))
 Assert.is_nil(bare.overlap_offset)
-Assert.eq(bare.style.radius, 12, "默认封面用 raised 圆角")
+Assert.eq(bare.style.radius, 6, "默认封面用 raised 小圆角")
 Assert.eq(bare.style.shadow, 2)
 local flat = select(1, Book.cover(nil, nil, {}, 80, 120, { shadow = false }))
-Assert.eq(flat.style.radius, 12, "无阴影也保留 raised 圆角，不回落 image 的 0")
+Assert.eq(flat.style.radius, 6, "无阴影也保留 raised 小圆角，不回落 image 的 0")
 Assert.eq(flat.style.shadow, 0)
+
+ui_conf.library_cover_radius = "square"
+local squared = select(1, Book.cover(nil, nil, {}, 80, 120, {}))
+Assert.eq(squared.style.radius, 0, "封面圆角=直角")
+Assert.eq(squared.style.shadow, 2, "只改半径，阴影仍跟主题")
+ui_conf.library_cover_radius = "round"
+local rounded = select(1, Book.cover(nil, nil, {}, 80, 120, { shadow = false }))
+Assert.eq(rounded.style.radius, 6, "封面圆角=圆角，无阴影也强制小圆角")
+ui_conf.library_cover_radius = "theme"
+Assert.eq(select(1, Book.cover(nil, nil, {}, 80, 120, {})).style.radius, 6, "跟随主题回到 raised")
 
 -- 混合模式：封面按书的 source_id 解析属主源，不用活跃源冒充。
 resolved = {}

@@ -547,6 +547,33 @@ local function stringColumn(sql, ...)
     return out
 end
 
+--- 卷身份看父系列的书架成员状态，其余身份看自己。
+---@param source BookSource
+---@param stable_id string
+---@return Book|nil
+function BookDB.shelfBook(source, stable_id)
+    local parent_id = type(source.volumeParent) == "function" and source:volumeParent(stable_id)
+    return BookDB.get(source.id, parent_id or stable_id)
+end
+
+--- 换账号不删任何数据：可加架的成员重推，其余成员交给新快照对账。
+--- 旧账号墓碑不再推删；依附记录一起准备，失败整批回滚。
+---@param source_id string
+---@param shelf_add boolean
+---@param stable_prefix string|nil WebDAV 换账号只处理 webdav:// 身份
+---@param source BookSource|nil 用于卷身份与源侧注解同步标识
+---@return boolean
+function BookDB.prepareAccountSync(source_id, shelf_add, stable_prefix, source)
+    return DB.transaction(function()
+        if not DB.exec([[UPDATE books SET sync_status=CASE WHEN deleted=0 THEN ? ELSE 1 END
+            WHERE source_id=? AND instr(stable_id, ?)=1;]],
+            shelf_add and 0 or 1, source_id, stable_prefix or "") then return false end
+        return require("book.progress_db").prepareAccountSync(source_id, stable_prefix, source)
+            and require("book.note_db").prepareAccountSync(source_id, stable_prefix, source)
+            and require("book.stats_db").prepareAccountSync(source_id, stable_prefix)
+    end) == true
+end
+
 --- 待推送到云端删除的 stable_id（deleted=1 且脏）。
 ---@param source_id string
 ---@return string[]
@@ -792,6 +819,18 @@ function BookDB.stableIdsByMd5(source_id, md5)
           ORDER BY inserted_at ASC, stable_id ASC;]], source_id, md5)
 end
 
+--- 扫盘改名/搬家候选：在架行，以及换书库目录后留下 path 的待重匹配行。
+--- 用户删除或盘上消失后的墓碑（path 已清空）不收编。
+---@param source_id string
+---@param md5 string
+---@return string[]
+function BookDB.moveCandidatesByMd5(source_id, md5)
+    return stringColumn([[SELECT stable_id FROM books
+          WHERE source_id=? AND md5=?
+            AND (deleted=0 OR (deleted=1 AND path IS NOT NULL AND instr(stable_id, 'webdav://')<>1))
+          ORDER BY inserted_at ASC, stable_id ASC;]], source_id, md5)
+end
+
 --- 挂在书身份上的核心表模块；note / progress / stats 顶层 require 本模块，只能延迟加载。
 local IDENTITY_MODULES = {
     "book.chapters_db", "book.note_db", "book.progress_db", "book.stats_db", "book.review_cache", "ai.summary_db", "book.toc_db",
@@ -818,8 +857,11 @@ function BookDB.renameStableId(source_id, old_stable_id, new_stable_id, category
         return true
     end
     return DB.transaction(function()
+        -- 待重匹配行（下架但 path 仍在）迁到新路径后重新上架；用户软删除 hidden 不动。
         return DB.exec(
-            [[UPDATE books SET stable_id=?, category=?, series=?, path=? WHERE source_id=? AND stable_id=?;]],
+            [[UPDATE books SET stable_id=?, category=?, series=?, path=?,
+                  deleted=CASE WHEN deleted=1 AND path IS NOT NULL THEN 0 ELSE deleted END
+                WHERE source_id=? AND stable_id=?;]],
             new_stable_id, category, series, new_stable_id, source_id, old_stable_id
         ) and moveIdentity(source_id, old_stable_id, new_stable_id, false)
     end) == true
@@ -908,13 +950,15 @@ end
 --- 它故意不上架）；墓碑（deleted=1 + sync_status=0，本地删了等推云端）不算。
 --- 已知取舍：远端对账下架的行也会落成「非成员身份行」，它会连同进度留在最近阅读里，
 --- 直到云端删除被确认、行被撕掉。
---- 本地源例外：它的「远端」就是磁盘，下架即文件没了（path 已清空），没有可读的东西，不能留进度行。
+--- 纯本地书下架后不进最近阅读：换书库目录后待按 md5 重匹配的行会留下 path，
+--- 但不能因此出现在「最近阅读」里。WebDAV 身份仍按「有本地缓存路径则可读」处理。
 ---@param alias string|nil books 表别名，缺省 b
 ---@return string SQL 片段
 function BookDB.readableClause(alias)
     alias = alias or "b"
     return "(" .. alias .. ".deleted=0 OR (" .. alias .. ".sync_status=1 AND NOT ("
-        .. alias .. ".source_id='local' AND " .. alias .. ".path IS NULL)))"
+        .. alias .. ".source_id='local' AND (" .. alias .. ".path IS NULL OR instr("
+        .. alias .. ".stable_id, 'webdav://')<>1))))"
 end
 
 --- 已下载条件（唯一口径）：章节源从当前阅读章（pending_progress.chapter_idx，无则第 1 章）起，
@@ -1083,6 +1127,40 @@ function BookDB.forgetSource(source_id)
     end) == true
 end
 
+---@class BookDataCleanup
+---@field books boolean|nil 书库索引和目录，不含阅读数据
+---@field reading boolean|nil 进度、统计、笔记及分析数据
+---@field stable_prefix string|nil
+---@field exclude boolean|nil 排除而不是包含前缀
+
+--- 用户主动清理；两类记录独立，不写墓碑，也不把清理标成待同步。
+---@param source_id string
+---@param opts BookDataCleanup
+---@return boolean
+function BookDB.clearSourceData(source_id, opts)
+    assert(opts.books or opts.reading, "no data selected")
+    local prefix, exclude = opts.stable_prefix, opts.exclude
+    return DB.transaction(function()
+        if opts.books then
+            if not DB.removeSource("books", source_id, prefix, exclude)
+                or not require("book.chapters_db").removeSource(source_id, prefix, exclude)
+                or not require("book.toc_db").removeSource(source_id, prefix, exclude) then return false end
+        end
+        if opts.reading then
+            local where, args = DB.identityClause(source_id, prefix, exclude)
+            if not DB.exec("UPDATE books SET read_at=0, read_state=0 WHERE " .. where .. ";",
+                unpack(args)) then return false end
+            for _idx, name in ipairs({
+                "book.progress_db", "book.note_db", "book.stats_db", "book.review_cache", "ai.summary_db",
+            }) do
+                if not require(name).removeSource(source_id, prefix, exclude) then return false end
+            end
+            if not Event.emit("source_reading_cleared", source_id, prefix, exclude) then return false end
+        end
+        return true
+    end) == true
+end
+
 --- 撕掉一本：books 行 + 依附表 + book_removed。不留墓碑。须在调用方事务内。
 ---@param source_id string
 ---@param stable_id string
@@ -1119,34 +1197,93 @@ function BookDB.forgetPrefix(source_id, prefix)
     return ok, forgotten
 end
 
---- 换本地书库根：旧根下、新根外的纯本地书整本撕掉（书架 + 进度 + 笔记 + 统计 + 目录…）。
---- 软下架不够：「最近阅读」仍认带进度的 deleted=1 行。WebDAV 身份不动；新根是旧根子目录时只踢外面的。
---- 含墓碑行；原书文件还在盘上，只清月读库。
+---@param path string
+---@param root string
+---@return boolean
+local function underRoot(path, root)
+    return path == root or path:sub(1, #root + 1) == root .. "/"
+end
+
+--- 换本地书库根：旧根下、新根外的纯本地书先收成待重匹配（下架但保留 path / 进度 / 笔记 / 统计）。
+--- 随后扫描可按 md5 把身份迁到新路径。已经没有 path 的墓碑无法再匹配，整本撕掉。
+--- WebDAV 身份、新根内的书、以及从不在旧根下的库外书不动。
 ---@param source_id string
 ---@param old_root string|nil
 ---@param new_root string|nil
 ---@return boolean
----@return string[] forgotten
-function BookDB.forgetOldRoot(source_id, old_root, new_root)
+---@return string[] forgotten 被撕掉的墓碑 stable_id（调用方清缓存用）
+function BookDB.stashOldRoot(source_id, old_root, new_root)
     local Text = require("utils.text")
     old_root = Text.rtrimSlashes(Text.rtrim(old_root))
     new_root = Text.rtrimSlashes(Text.rtrim(new_root))
     local forgotten = {}
     if old_root == "" or old_root == new_root then return true, forgotten end
-    ---@param path string
-    ---@param root string
-    ---@return boolean
-    local function under(path, root)
-        return path == root or path:sub(1, #root + 1) == root .. "/"
-    end
     local ok = DB.transaction(function()
         for _idx, stable_id in ipairs(BookDB.stableIdsBySource(source_id)) do
             if stable_id:sub(1, 9) ~= "webdav://"
-                and under(stable_id, old_root)
-                and not (new_root ~= "" and under(stable_id, new_root)) then
-                if not forgetOne(source_id, stable_id) then return false end
-                forgotten[#forgotten + 1] = stable_id
+                and underRoot(stable_id, old_root)
+                and not (new_root ~= "" and underRoot(stable_id, new_root)) then
+                local row = BookDB.get(source_id, stable_id)
+                if row and row.deleted == 1 and not row.path then
+                    if not forgetOne(source_id, stable_id) then return false end
+                    forgotten[#forgotten + 1] = stable_id
+                elseif row and row.deleted == 0 then
+                    if not DB.exec([[UPDATE books SET deleted=1 WHERE source_id=? AND stable_id=?;]],
+                        source_id, stable_id) then
+                        return false
+                    end
+                end
             end
+        end
+        return true
+    end) == true
+    return ok, forgotten
+end
+
+--- 当前书库根之外、仍在架且已同步的纯本地书收成待重匹配（扫盘兜底：设置项被直接改掉时也能迁记录）。
+--- 库外开过的脏行（sync_status=0）不动。
+---@param source_id string
+---@param root string|nil
+---@return boolean
+function BookDB.stashSyncedOutsideRoot(source_id, root)
+    local Text = require("utils.text")
+    root = Text.rtrimSlashes(Text.rtrim(root))
+    if root == "" then return true end
+    return DB.transaction(function()
+        for _idx, stable_id in ipairs(BookDB.libraryStableIdsBySource(source_id)) do
+            if stable_id:sub(1, 9) ~= "webdav://" and not underRoot(stable_id, root) then
+                local row = BookDB.get(source_id, stable_id)
+                if row and row.sync_status == 1
+                    and not DB.exec([[UPDATE books SET deleted=1 WHERE source_id=? AND stable_id=?;]],
+                        source_id, stable_id) then
+                    return false
+                end
+            end
+        end
+        return true
+    end) == true
+end
+
+--- 待重匹配行：下架但 path 仍指向旧位置的纯本地书。
+---@param source_id string
+---@return string[]
+function BookDB.relocatingIds(source_id)
+    return stringColumn([[SELECT stable_id FROM books
+          WHERE source_id=? AND deleted=1 AND path IS NOT NULL AND instr(stable_id, 'webdav://')<>1
+          ORDER BY stable_id;]], source_id)
+end
+
+--- 整本撕掉一批书（及依附表），不留墓碑。
+---@param source_id string
+---@param ids string[]
+---@return boolean
+---@return string[] forgotten
+function BookDB.forgetMany(source_id, ids)
+    local forgotten = {}
+    local ok = DB.transaction(function()
+        for _idx, stable_id in ipairs(ids) do
+            if not forgetOne(source_id, stable_id) then return false end
+            forgotten[#forgotten + 1] = stable_id
         end
         return true
     end) == true

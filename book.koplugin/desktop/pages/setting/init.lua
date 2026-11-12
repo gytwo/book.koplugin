@@ -123,6 +123,16 @@ local function coreEntries(desktop)
             },
         },
         {
+            group = "library", order = 30, id = "source_cleanup",
+            row = function(iw)
+                return Row.widget({
+                    width = iw, kind = "nav", icon = "delete_sweep", title = _("数据清理"),
+                    subtitle = _("选择书源，清理本机书籍或阅读记录"),
+                    callback = function() require("source.cleanup").pick(desktop) end,
+                })
+            end,
+        },
+        {
             group = "appearance", order = 10, id = "appearance", icon = "palette", title = _("主题与字体"),
             subtitle = _("界面风格、字体、缩放"),
             status = string.format("%d%%", Theme.scale()), status_on = true,
@@ -248,7 +258,6 @@ local function coreEntries(desktop)
             },
         },
         network,
-        { group = "maintenance", order = 70, id = "debug_log", row = Maintenance:debugLogRow(desktop) },
         { group = "maintenance", order = 90, id = "close_desktop", row = Maintenance:closeRow(desktop) },
     }
 end
@@ -356,8 +365,8 @@ local GROUP_FOLDERS = {
         },
         {
             id = "other", icon = "info", title = _("其它"),
-            subtitle = _("调试与关闭桌面"), default = true,
-            match = { "debug_log", "close_desktop" },
+            subtitle = _("关闭桌面"), default = true,
+            match = { "close_desktop" },
         },
     },
 }
@@ -469,6 +478,9 @@ end
 ---@param desktop BookDesktop
 ---@return table[]
 function Settings.groups(desktop)
+    -- 更新已换盘、进程未重启时补登约定文件（壁纸等），避免外观页缺项要整机重启。
+    local root = desktop.plugin and desktop.plugin.path
+    require("utils.extension").emit("setting.before_groups", root)
     local entries = coreEntries(desktop)
     for _idx, entry in ipairs(Tree.features(desktop)) do entries[#entries + 1] = entry end
     local roots = {

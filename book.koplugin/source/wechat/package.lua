@@ -9,6 +9,7 @@
 --]]
 
 local bit = require("bit")
+local ffi = require("ffi")
 local JSON = require("json")
 local Aes = require("crypto.aes")
 local Inflate = require("utils.inflate")
@@ -71,22 +72,44 @@ local function zipDecrypt(data, password)
         k2 = crcUpdate(k2, bit.rshift(k1, 24)) % 4294967296
     end
     for i = 1, #password do update(password:byte(i)) end
-    local out = {}
+    local size = math.max(0, #data - 12)
+    local out = ffi.new("uint8_t[?]", size)
     for i = 1, #data do
         local t = bit.bor(k2, 2) % 65536
         local c = bit.bxor(data:byte(i), bit.band(bit.rshift(t * bit.bxor(t, 1), 8), 0xff))
         update(c)
-        out[i] = c
+        if i > 12 then out[i - 13] = c end
     end
-    local chunks = {}
-    for i = 13, #out, 4096 do
-        chunks[#chunks + 1] = string.char(unpack(out, i, math.min(i + 4095, #out)))
-    end
-    return table.concat(chunks)
+    return ffi.string(out, size)
 end
 
 local function u16(s, p) local a, b = s:byte(p, p + 1) return a + b * 256 end
 local function u32(s, p) local a, b, c, d = s:byte(p, p + 3) return a + b * 256 + c * 65536 + d * 16777216 end
+
+--- 解压峰值增量（字节）：正文分块与拼接各一份；密文切片、解密缓冲与解密字符串各一份最大压缩块。
+--- `data` 已在内存里，MemAvailable 已包含它；预检只问额外还要多少。
+--- 另留 64KB 给 inflate 输出缓冲；解析失败时沿用 3× 包长估计。
+---@param data string
+---@return number
+function Package.unzipNeed(data)
+    data = data or ""
+    local fallback = 3 * #data
+    local eocd
+    for p = #data - 21, math.max(1, #data - 65557), -1 do
+        if u32(data, p) == 0x06054b50 then eocd = p break end
+    end
+    if not eocd then return fallback end
+    local sum_un, max_c, p = 0, 0, u32(data, eocd + 16) + 1
+    for _entry = 1, u16(data, eocd + 10) do
+        if u32(data, p) ~= 0x02014b50 then return fallback end
+        local csize, usize = u32(data, p + 20), u32(data, p + 24)
+        local nlen, elen, clen = u16(data, p + 28), u16(data, p + 30), u16(data, p + 32)
+        sum_un = sum_un + usize
+        if csize > max_c then max_c = csize end
+        p = p + 46 + nlen + elen + clen
+    end
+    return 2 * sum_un + 3 * max_c + 65536
+end
 
 --- 解开整个 zip（走中央目录，数据描述符模式也能用）。
 ---@param data string
@@ -139,6 +162,69 @@ function Package.pickStyle(files)
     end
     table.sort(names)
     return names[1] and files[names[1]] or nil
+end
+
+--- 官方 /book/chapterdownload 的 chapters 参数。
+--- 连续 uid 写成 a-b；缓存/批量时带上 0（整书样式）。第一批若从 1 起连续，合并成 0-n（如 0-5）；
+--- 其后是 0,a-b（如 0,6-10）。非数字 uid 退回 0,u1,u2,…。
+---@param uids (string|number)[] 本章批次的 chapterUid（不含 0）
+---@return string
+function Package.formatChaptersParam(uids)
+    uids = uids or {}
+    if #uids == 0 then return "0" end
+    local nums = {}
+    for i, u in ipairs(uids) do
+        local n = tonumber(u)
+        if not n then
+            local parts = { "0" }
+            for _idx, x in ipairs(uids) do parts[#parts + 1] = tostring(x) end
+            return table.concat(parts, ",")
+        end
+        nums[i] = n
+    end
+    local contiguous = true
+    for i = 2, #nums do
+        if nums[i] ~= nums[i - 1] + 1 then contiguous = false; break end
+    end
+    if contiguous then
+        local a, b = nums[1], nums[#nums]
+        if a == 1 then return "0-" .. tostring(b) end
+        if a == b then return "0," .. tostring(a) end
+        return "0," .. tostring(a) .. "-" .. tostring(b)
+    end
+    local parts = { "0" }
+    for _idx, n in ipairs(nums) do parts[#parts + 1] = tostring(n) end
+    return table.concat(parts, ",")
+end
+
+--- 从已解包的 zip 按 uid 列表抽出各章正文（及可选样式）。
+---@param files table<string, string>
+---@param book_id string
+---@param uids (string|number)[]
+---@param book_type '"epub"'|'"txt"'
+---@return table<string, { text: string|nil, err: string|nil, format: string }>
+---@return string|nil style
+function Package.extractChapters(files, book_id, uids, book_type)
+    local out = {}
+    for _idx, uid in ipairs(uids) do
+        local key = tostring(uid)
+        if book_type == "txt" then
+            local text = Package.chapterZipText(files, book_id, uid)
+            if text then
+                out[key] = { text = text, format = "txt" }
+            else
+                out[key] = { err = "zip: chapter " .. key .. " not in package", format = "txt" }
+            end
+        else
+            local html, err = Package.chapterHtml(files, uid)
+            if html then
+                out[key] = { text = html, format = "html" }
+            else
+                out[key] = { err = err or ("package: chapter " .. key .. " not in package"), format = "html" }
+            end
+        end
+    end
+    return out, Package.pickStyle(files)
 end
 
 --- 取某章的 xhtml：章节由主文件（标题 / 插图）加若干 _000N 续篇组成，续篇 body 依次并入主文件 body 末尾。

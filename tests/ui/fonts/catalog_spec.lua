@@ -1,5 +1,5 @@
 --[[--
-ui.fonts.catalog 字体列表：微信列表走 Request.get 的 cache_ttl，解析失败清缓存并带回错误。
+ui.fonts.catalog 字体列表：微信列表走 http.Cache（30 天 TTL），命中不联网；过期后重拉；失败回落过期列表。可关闭在线字体。
 
 @module tests.ui.fonts.catalog_spec
 --]]
@@ -57,8 +57,9 @@ package.preload["utils.paths"] = function()
         ensureFonts = function() end,
     }
 end
+local ui_settings = {}
 package.preload["utils.settings"] = function()
-    return { get = function() return {} end }
+    return { get = function() return ui_settings end }
 end
 
 local body = '{"items":[{"id":"f1","name":"F1","url":"https://x/f1.zip"}]}'
@@ -72,8 +73,46 @@ package.preload["http.request"] = function()
         end,
     }
 end
+local cache_store = {}
 package.preload["http.cache"] = function()
-    return { clear = function(sub) cleared[#cleared + 1] = sub end }
+    return {
+        key = function(method, url) return string.upper(method or "GET") .. " " .. url end,
+        forget = function(key)
+            if type(key) == "string" and key ~= "" then cache_store[key] = nil end
+        end,
+        clear = function(sub)
+            cleared[#cleared + 1] = sub
+            if sub == nil or sub == "" then
+                cache_store = {}
+                return
+            end
+            for key in pairs(cache_store) do
+                if key:find(sub, 1, true) then cache_store[key] = nil end
+            end
+        end,
+        fetch = function(key, ttl, load, cb, opts)
+            opts = opts or {}
+            if key then
+                local row = cache_store[key]
+                if row and row.expires > os.time() then
+                    cb(row.value)
+                    return { cancel = function() end }
+                end
+            end
+            return load(function(value, err)
+                if value ~= nil and err == nil then
+                    if key then cache_store[key] = { value = value, expires = os.time() + ttl } end
+                    cb(value, err)
+                    return
+                end
+                if opts.stale_on_error and key and cache_store[key] then
+                    cb(cache_store[key].value)
+                    return
+                end
+                cb(value, err)
+            end) or { cancel = function() end }
+        end,
+    }
 end
 local scans = 0
 package.preload["workers.job"] = function()
@@ -104,32 +143,85 @@ end
 
 list()
 Assert.len(gets, 1)
-Assert.is_true(gets[1].opts.cache_ttl > 0, "列表走 http.Cache TTL")
+Assert.eq(gets[1].url, Catalog.LIST_URL)
+Assert.eq(Catalog.LIST_TTL, 30 * 24 * 3600, "在线字体列表缓存 30 天")
 Assert.eq(items[1].id, "f1")
 Assert.eq(items[1].kind, "weread")
 Assert.is_nil(err)
 Assert.len(cleared, 0)
 Assert.eq(scans, 1)
+local list_key = "GET " .. Catalog.LIST_URL
+Assert.not_nil(cache_store[list_key], "列表写入持久化缓存")
+Assert.is_true(cache_store[list_key].expires >= os.time() + Catalog.LIST_TTL)
 
 -- 分组：fonts 根目录 = 用户，子目录 = 本地，FontList 其余 = 系统；
 -- 显示名：本地化名 → 中文界面任一中文名 → 族名 → 文件名；同 basename 只留先到的；woff 不列
 Assert.eq(installed(), "user:Plain.otf=Plain Sans,user:KaiCN.ttf=简体楷,user:WenKai.ttf=霞鹜文楷,"
     .. "local:Bare-Font.ttf=Bare-Font,system:System.ttf=System Sans")
 
--- 再次打开：本地扫描会话内复用，不再起子进程；微信列表仍走 http.Cache
+-- 命中：本地扫描会话内复用；有效缓存不重新拉取在线列表
 list()
 Assert.eq(scans, 1, "本地字体一个会话只扫一次")
-Assert.len(gets, 2)
+Assert.len(gets, 1, "TTL 内命中缓存不联网")
 Assert.eq(items[1].id, "f1")
 
--- 坏数据：清掉缓存，别让它在 TTL 内一直命中；列表仍回调（只剩本地）并带错误
+-- 过期：当作未命中，重新拉取并刷新过期时间
+cache_store[list_key].expires = os.time() - 1
+list()
+Assert.len(gets, 2, "过期后重新拉取")
+Assert.eq(items[1].id, "f1")
+Assert.is_nil(err)
+Assert.is_true(cache_store[list_key].expires >= os.time() + Catalog.LIST_TTL, "过期后写入新的 TTL")
+
+-- 过期且拉取失败：回落磁盘上的旧列表，不把用户置于空列表
+cache_store[list_key].expires = os.time() - 1
+local saved_get = require("http.request").get
+require("http.request").get = function(_url, _opts, cb)
+    gets[#gets + 1] = { url = _url, opts = _opts }
+    cb(nil, "network down")
+    return { cancel = function() end }
+end
+list()
+Assert.len(gets, 3)
+Assert.eq(items[1].id, "f1", "失败时保留过期列表")
+Assert.is_nil(err, "有旧列表时不把失败抛给调用方")
+require("http.request").get = saved_get
+
+-- 未命中且回包无法解析：不写入缓存，列表仍回调（只剩本地）并带错误
+cache_store[list_key] = nil
 body = "<html>oops</html>"
 list()
-Assert.len(cleared, 1)
-Assert.eq(cleared[1], gets[3].url)
+Assert.is_nil(cache_store[list_key], "解析失败不写入缓存")
 Assert.len(items, 5)
 Assert.eq(items[1].kind, "user")
 Assert.eq(err, "字体列表解析失败")
+
+-- 在线字体关闭：不再拉取或下载，已安装的仍可使用
+do
+    body = '{"items":[{"id":"f1","name":"F1","url":"https://x/f1.zip"}]}'
+    cache_store[list_key] = nil
+    local before = #gets
+    ui_settings.online_fonts = false
+    list()
+    Assert.len(gets, before, "关闭后不拉取在线列表")
+    Assert.len(items, 5)
+    Assert.eq(items[1].kind, "user")
+    Assert.is_nil(err)
+    Assert.is_false(Catalog.onlineEnabled())
+
+    local downloaded = false
+    require("http.request").download = function()
+        downloaded = true
+        error("should not download")
+    end
+    local ok, e
+    Catalog.ensureInstalledAsync({ name = "f1", kind = "weread", id = "f1", url = "https://x/f1.zip" }, nil,
+        function(r, er) ok, e = r, er end)
+    Assert.is_nil(ok)
+    Assert.eq(e, "在线字体已关闭")
+    Assert.is_false(downloaded)
+    ui_settings.online_fonts = nil
+end
 
 -- 英文界面不退回中文名（重载模块以重扫）
 GetText.current_lang = "en"
@@ -139,10 +231,34 @@ list()
 Assert.eq(installed(), "user:KaiCN.ttf=Kai CN,user:Plain.otf=Plain Sans,user:WenKai.ttf=霞鹜文楷,"
     .. "local:Bare-Font.ttf=Bare-Font,system:System.ttf=System Sans")
 
+-- 下载过程日志：抓 utils.log，确认里程碑带上 id / 落盘路径，且不把完整 URL 打进去。
+local font_logs = {}
+local function hookFontLogs()
+    font_logs = {}
+    local logger = require("utils.log")
+    local function hook(level)
+        return function(...)
+            local parts = { level }
+            for i = 1, select("#", ...) do
+                parts[#parts + 1] = tostring(select(i, ...))
+            end
+            font_logs[#font_logs + 1] = table.concat(parts, " ")
+        end
+    end
+    logger.info, logger.warn = hook("info"), hook("warn")
+    logger.flushSync = function() end
+end
+local function findFontLog(needle)
+    for _idx, line in ipairs(font_logs) do
+        if line:find(needle, 1, true) then return line end
+    end
+end
+
 -- 下载到的不是 zip（强制门户 / CDN 错误页以 200 返回）：解压前按魔数拒绝，删掉残包，回调失败
 do
     local dir = Config.dir() .. "/font_list_spec_absent"
     os.execute("mkdir -p '" .. dir .. "'")
+    hookFontLogs()
     require("http.request").download = function(_opts, dest, cb)
         local f = assert(io.open(dest, "wb"))
         f:write("<html>blocked</html>")
@@ -151,11 +267,80 @@ do
         return { cancel = function() end }
     end
     local ok, e
-    Catalog.ensureInstalledAsync({ name = "f1", kind = "weread", id = "f1", url = "https://x/f1.zip" }, nil,
+    Catalog.ensureInstalledAsync({ name = "f1", kind = "weread", id = "f1", url = "https://x/f1.zip", zip_size = 12 }, nil,
         function(r, er) ok, e = r, er end)
     Assert.is_nil(ok)
     Assert.eq(e, "字体解压失败")
     Assert.is_nil(io.open(dir .. "/f1.zip", "rb"), "残包已删")
+    local start = findFontLog("info book.font download start")
+    Assert.not_nil(start)
+    Assert.not_nil(start:find("f1", 1, true))
+    Assert.not_nil(start:find("dest=" .. dir .. "/f1.ttf", 1, true))
+    Assert.not_nil(start:find("zip=" .. dir .. "/f1.zip", 1, true))
+    Assert.not_nil(start:find("zip_size=12", 1, true))
+    Assert.not_nil(start:find("host=x", 1, true))
+    Assert.is_nil(start:find("https://x/f1.zip", 1, true), "不记录完整下载地址")
+    Assert.not_nil(findFontLog("info book.font download done"))
+    Assert.not_nil(findFontLog("info book.font extract start"))
+    local failed = findFontLog("warn book.font extract failed")
+    Assert.not_nil(failed)
+    Assert.not_nil(failed:find(dir .. "/f1.ttf", 1, true))
+    Assert.is_nil(findFontLog("book.font installed"))
+    os.execute("rm -rf '" .. dir .. "'")
+end
+
+-- 下载失败也要留下路径，方便对照半截 zip
+do
+    local dir = Config.dir() .. "/font_list_spec_absent"
+    os.execute("mkdir -p '" .. dir .. "'")
+    hookFontLogs()
+    require("http.request").download = function(_opts, _dest, cb)
+        cb(false, "timeout")
+        return { cancel = function() end }
+    end
+    local ok, e
+    Catalog.ensureInstalledAsync({ name = "f1", kind = "weread", id = "f1", url = "https://x/f1.zip" }, nil,
+        function(r, er) ok, e = r, er end)
+    Assert.is_nil(ok)
+    Assert.eq(e, "timeout")
+    local failed = findFontLog("warn book.font download failed")
+    Assert.not_nil(failed)
+    Assert.not_nil(failed:find("zip=" .. dir .. "/f1.zip", 1, true))
+    Assert.not_nil(failed:find("timeout", 1, true))
+    Assert.is_nil(findFontLog("book.font extract start"))
+    os.execute("rm -rf '" .. dir .. "'")
+end
+
+-- 内存不够：下载完成后不解压、不转码，弹窗并回调失败
+do
+    local dir = Config.dir() .. "/font_list_spec_absent"
+    os.execute("mkdir -p '" .. dir .. "'")
+    hookFontLogs()
+    local shown
+    package.loaded["ui.themes.widgets.confirm"] = {
+        new = function(_, opts) shown = opts; return { show = function() end } end,
+    }
+    local Mem = require("utils.mem")
+    local saved = Mem.availableBytes
+    Mem.availableBytes = function() return 1024 end
+    require("http.request").download = function(_opts, dest, cb)
+        local f = assert(io.open(dest, "wb"))
+        f:write("PK\3\4" .. ("x"):rep(2000))
+        f:close()
+        cb(true)
+        return { cancel = function() end }
+    end
+    local ok, e
+    Catalog.ensureInstalledAsync({ name = "f1", kind = "weread", id = "f1", url = "https://x/f1.zip" }, nil,
+        function(r, er) ok, e = r, er end)
+    Assert.is_nil(ok)
+    Assert.eq(e, "内存不足")
+    Assert.is_nil(findFontLog("book.font extract start"), "不够内存不能开工")
+    Assert.is_nil(io.open(dir .. "/f1.zip", "rb"), "不够内存时删掉 zip")
+    Assert.not_nil(shown)
+    Assert.is_true(shown.text:find("字体解压", 1, true) ~= nil)
+    Mem.availableBytes = saved
+    package.loaded["ui.themes.widgets.confirm"] = nil
     os.execute("rm -rf '" .. dir .. "'")
 end
 
@@ -211,7 +396,10 @@ do
         called, result, failure = called + 1, ok, err
     end
     write(Fonts.wereadPath("aik"), "test-sfnt")
+    hookFontLogs()
     local handle = Catalog.ensureInstalledAsync({ name = "aik", kind = "weread", id = "aik" }, nil, callback)
+    Assert.not_nil(findFontLog("info book.font prepare start"))
+    Assert.not_nil(findFontLog("src=" .. Fonts.wereadPath("aik")))
     Assert.eq(called, 0, "返回前不回调成功")
     Assert.len(repairs, 0, "返回前不读写字体")
     Assert.eq(jobs[1].opts.name, "font.prepare")
@@ -267,12 +455,23 @@ do
         cb(true)
         return { cancel = function() end }
     end
-    Catalog.ensureInstalledAsync({ name = "new", kind = "weread", id = "new", url = "https://x/new.zip" }, nil, callback)
+    hookFontLogs()
+    Catalog.ensureInstalledAsync({ name = "new", kind = "weread", id = "new", url = "https://cdn.example/new.zip?sign=secret", zip_size = 2048 }, nil, callback)
     Assert.eq(jobs[6].opts.name, "font.extract")
+    local start = findFontLog("info book.font download start")
+    Assert.not_nil(start)
+    Assert.not_nil(start:find("dest=" .. Fonts.wereadPath("new"), 1, true))
+    Assert.not_nil(start:find("zip_size=2048", 1, true))
+    Assert.not_nil(start:find("host=cdn.example", 1, true))
+    Assert.is_nil(start:find("sign=secret", 1, true), "不记录签名参数")
     run(jobs[6])
     Assert.is_true(result)
     Assert.eq(repairs[#repairs], Fonts.wereadPath("new"))
     Assert.len(jobs, 6)
+    Assert.not_nil(findFontLog("info book.font download done"))
+    Assert.not_nil(findFontLog("info book.font extract start"))
+    Assert.not_nil(findFontLog("info book.font woff convert start " .. Fonts.wereadPath("new")))
+    Assert.eq(findFontLog("info book.font installed"), "info book.font installed new " .. Fonts.wereadPath("new"))
 
     repair_error = "repair failed"
     Catalog.ensureInstalledAsync({ name = "bad", kind = "weread", id = "bad", url = "https://x/bad.zip" }, nil, callback)
@@ -280,6 +479,30 @@ do
     Assert.is_nil(result)
     Assert.eq(failure, "字体解压失败")
     Assert.is_false(Fonts.isFile(Fonts.wereadPath("bad")), "新安装失败不能留下伪装成功的字体")
+    -- 关闭在线字体：未安装的不下载；已落盘的仍走本地准备
+    ui_settings.online_fonts = false
+    local downloaded = false
+    require("http.request").download = function()
+        downloaded = true
+        error("should not download")
+    end
+    called, result, failure = 0, nil, nil
+    Catalog.ensureInstalledAsync({ name = "missing", kind = "weread", id = "missing", url = "https://x/missing.zip" }, nil, callback)
+    Assert.eq(called, 1)
+    Assert.is_nil(result)
+    Assert.eq(failure, "在线字体已关闭")
+    Assert.is_false(downloaded)
+
+    repair_error = nil
+    called, result, failure = 0, nil, nil
+    Catalog.ensureInstalledAsync({ name = "aik", kind = "weread", id = "aik" }, nil, callback)
+    Assert.eq(jobs[#jobs].opts.name, "font.prepare")
+    run(jobs[#jobs])
+    Assert.is_true(result)
+    Assert.is_nil(failure)
+    Assert.is_false(downloaded)
+    ui_settings.online_fonts = nil
+
     for _, id in ipairs({ "aik", "legacy", "new" }) do os.remove(Fonts.wereadPath(id)) end
     os.remove(dir .. "/bad.ttf.space.part")
     os.execute("rmdir '" .. dir .. "'")

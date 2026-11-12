@@ -23,7 +23,8 @@ local M = {}
 ---@field settings FanqieSettings
 ---@field client FanqieClient
 
-local Source = setmetatable({}, { __index = Base })
+-- 书架双向（shelfActionAsync add/delete）；换账号要重推本地成员。
+local Source = setmetatable({ shelf_add = true }, { __index = Base })
 Source.__index = Source
 
 function M.meta()
@@ -237,6 +238,49 @@ function Source:getDetailAsync(identity, cb)
     return h
 end
 
+--- 刷新目录时按 uid 并入已缓存的章内锚点。TocDB.put 只保留同 uid 的 words/paid，不会带回 extra。
+---@param previous BookChapter[]|nil
+---@param toc BookChapter[]
+local function mergeCachedAnchors(previous, toc)
+    if not previous or #previous == 0 then return end
+    local Content = require("source.fanqie.content")
+    local by_uid = {}
+    for _idx, chapter in ipairs(previous) do
+        if chapter.uid then
+            by_uid[tostring(chapter.uid)] = chapter
+        end
+    end
+    for _idx, chapter in ipairs(toc) do
+        local old = chapter.uid and by_uid[tostring(chapter.uid)]
+        if old then
+            Content.merge_anchors(chapter, old.anchors)
+        end
+    end
+end
+
+--- 正文刚下完时，把章内锚点写进已缓存目录（失败不影响开章）。
+---@param identity BookIdentity
+---@param chapter BookChapter
+---@param html string
+local function persistAnchorsFromHtml(identity, chapter, html)
+    local Toc = require("source.toc")
+    local Content = require("source.fanqie.content")
+    local source_id = identity.source_id or "fanqie"
+    local list = Toc.read(source_id, identity.stable_id)
+    if not list then return end
+    local target
+    for _idx, item in ipairs(list) do
+        if item.uid == tostring(chapter.uid) or item.idx == chapter.idx then
+            target = item
+            break
+        end
+    end
+    if not target then return end
+    if Content.merge_anchors(target, Content.html_anchors(html, (target.depth or 1) + 1)) then
+        Toc.put(source_id, identity.stable_id, list)
+    end
+end
+
 --- 强制拉目录并写回；失败由调用方继续用旧缓存。
 ---@param identity BookIdentity
 ---@param cb fun(toc: BookChapter[]|nil, err: string|nil)
@@ -258,12 +302,16 @@ function Source:refreshTocAsync(identity, cb)
             toc[#toc + 1] = {
                 idx = #toc + 1, uid = tostring(row.itemId), title = row.title,
                 words = w and w > 0 and w or nil,
+                depth = row.depth,
+                volume = row.volume,
+                anchors = row.anchors,
             }
         end
         if #toc == 0 then
             cb(nil, _("番茄目录为空"))
             return
         end
+        mergeCachedAnchors(Toc.read(self.id, identity.stable_id), toc)
         if not Toc.put(self.id, identity.stable_id, toc) then
             cb(nil, _("章节目录保存失败"))
             return
@@ -274,7 +322,8 @@ function Source:refreshTocAsync(identity, cb)
 end
 
 function Source:loadTocAsync(identity, cb)
-    local cached = require("source.toc").read(self.id, identity.stable_id)
+    local Toc = require("source.toc")
+    local cached = Toc.read(self.id, identity.stable_id)
     if cached and #cached > 0 then
         return Base.defer(cb, cached)
     end
@@ -322,6 +371,7 @@ local function fetch(self, identity, chapter, cb)
                 Paths.bookWorkDir(identity.stable_id, identity.source_id) .. "/images", downloadImage,
                 function(html)
                     if h.cancelled then return end
+                    persistAnchorsFromHtml(identity, chapter, html)
                     cb({ title = title, html = html })
                 end)
             return

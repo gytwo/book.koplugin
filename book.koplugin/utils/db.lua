@@ -199,6 +199,47 @@ function DB.query(sql, ...)
     return result, nrows or 0
 end
 
+--- 逐行回调，不把整份结果集收进内存。fn 返回 false 时提前结束。
+---@param sql string
+---@param binds any[]|nil 绑定到 ? 的参数（按下标 1..n）
+---@param fn fun(row: table, names: table|nil): boolean|nil
+---@return boolean ok
+function DB.each(sql, binds, fn)
+    DB.ensure()
+    if not conn then
+        return false
+    end
+    local argc = type(binds) == "table" and #binds or 0
+    local stmt
+    local started_at = Perf.now()
+    local ok, err = pcall(function()
+        stmt = conn:prepare(sql)
+        if argc > 0 then
+            stmt:bind(unpack(binds, 1, argc))
+        end
+        while true do
+            local row, names = stmt:step({}, {})
+            if not row then
+                break
+            end
+            if fn(row, names) == false then
+                break
+            end
+        end
+    end)
+    closeStmt(stmt)
+    local elapsed_ms = Perf.elapsedMs(started_at)
+    if not ok then
+        noteError(err)
+        logger.warn("book.db each failed", err, sql, "params", unpack(binds or {}, 1, argc))
+        return false
+    end
+    if elapsed_ms >= SLOW_QUERY_MS then
+        logger.dbg("book.db slow each", "ms", elapsed_ms, sql)
+    end
+    return true
+end
+
 ---@type { name: string, fn: fun(): boolean }[]
 local schemas = {}
 local schema_ready = false
@@ -320,12 +361,13 @@ function DB.removeIdentity(tbl, source_id, stable_id)
     return DB.exec("DELETE FROM " .. tbl .. " WHERE source_id=? AND stable_id=?;", source_id, stable_id) ~= nil
 end
 
---- 删掉表里某个源的全部行（退出登录清本地记录；不留墓碑，也不上传）。
+--- 删掉表里某个源的本地记录，不留墓碑，也不上传。
 ---@param tbl string 表名（调用方保证可信，不含用户输入）
 ---@param source_id string
 ---@return boolean
-function DB.removeSource(tbl, source_id)
-    return DB.exec("DELETE FROM " .. tbl .. " WHERE source_id=?;", source_id) ~= nil
+function DB.removeSource(tbl, source_id, stable_prefix, exclude)
+    local where, args = DB.identityClause(source_id, stable_prefix, exclude)
+    return DB.exec("DELETE FROM " .. tbl .. " WHERE " .. where .. ";", unpack(args)) ~= nil
 end
 
 --- 把 source_id（单源字符串或多源表）收成 `col=?` / `col IN (…)`，并追加绑定参数。
@@ -350,6 +392,21 @@ function DB.sourceClause(column, source_id, args)
         args[#args + 1] = source_id[i]
     end
     return column .. " IN (" .. table.concat(placeholders, ",") .. ")", args
+end
+
+--- 身份范围，可包含或排除 stable_id 前缀；instr 区分大小写，且不把 % / _ 当通配符。
+---@param source_id string
+---@param stable_prefix string|nil
+---@param exclude boolean|nil
+---@return string
+---@return table
+function DB.identityClause(source_id, stable_prefix, exclude)
+    local where, args = DB.sourceClause("source_id", source_id)
+    if stable_prefix then
+        where = where .. " AND instr(stable_id,?)" .. (exclude and "<>1" or "=1")
+        args[#args + 1] = stable_prefix
+    end
+    return where, args
 end
 
 return DB

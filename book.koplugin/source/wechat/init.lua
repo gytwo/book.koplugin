@@ -85,6 +85,7 @@ function Source:capabilities()
         scrape = false,
         edit = true,
         stats_pull = true,
+        shelf_add = true,
     }
 end
 
@@ -842,18 +843,21 @@ end
 ---@param cb fun()|nil
 ---@return { cancel: fun() }
 function Source:prefetchChaptersAsync(identity, toc, from_idx, count, cb)
-    return require("source.chapter").prefetchAsync(identity, identity.book, toc, from_idx, count, {
+    -- 阅读中预取也按官方五章一批（带样式 0）；offline=0，与单章在线一致。
+    return WChapter.prefetchBatchedAsync(identity, toc, from_idx, count, {
         fetchContent = fetchContent,
+        book = identity.book,
+        offline = false,
     }, cb)
 end
 
---- 缓存整本章节正文；目录只拉一次，正文按序下载并返回部分成功统计。
+--- 缓存整本章节正文；目录只拉一次，正文按官方五章一批（offline=1）下载。
 ---@param identity BookIdentity
 ---@param on_progress fun(done: integer, total: integer)|nil
 ---@param cb fun(ok: boolean, cached: integer, err: string|nil, total: integer, failed: integer)
 ---@return { cancel: fun() }
 function Source:cacheAllChaptersAsync(identity, on_progress, cb, range)
-    return require("source.chapter").cacheAllAsync(self, identity, fetchContent, on_progress, cb, nil, range)
+    return WChapter.cacheAllBatchedAsync(self, identity, on_progress, cb, range)
 end
 
 --- 拉取云端进度并补齐本地需要的坐标。
@@ -1040,8 +1044,8 @@ function Source:putProgressAsync(identity, pos, cb)
             if cancelled then return end
             if not source then cb(nil, format); return end
             local offset, summary, fraction, map_err = Position.encode(identity, chapter, pos, source, format)
-            -- offset=0 是章首合法坐标；只有 nil 才是映射失败。
-            -- 坐标暂时无法映射时保留脏行，不能把未上传的进度标成已同步。
+            -- offset=0 是章首合法坐标。正文已加载时 encode 会回退到章级比例，一般不再返回 nil；
+            -- 若仍为空（防御），保留脏行待重试，不能把未上传的进度标成已同步。
             if offset == nil then
                 cb(nil, map_err or _("无法定位阅读进度"))
                 return
@@ -1466,6 +1470,21 @@ end
 --- 上传当前章的划线与想法。
 --- 微信读书的划线坐标依赖章节 HTML，因此只能按章推送：identity 必须带 chapter_idx，
 --- 且该章正文已落盘（缺 HTML 时无法定位划线区间）。无可推送内容直接回调成功。
+---@param annotations table[] KOReader 注解数组，就地改写
+---@return table[]
+function Source:resetAccountAnnotations(annotations)
+    for index = #annotations, 1, -1 do
+        local item = annotations[index]
+        if item.wr_deleted then
+            table.remove(annotations, index)
+        else
+            item.wr_bookmark_id, item.wr_review_id = nil, nil
+            item.wr_delete_review, item.wr_update_review, item.wr_update_bookmark = nil, nil, nil
+        end
+    end
+    return annotations
+end
+
 ---@param identity BookIdentity
 ---@param annotations table[] KOReader 注解数组，就地改写
 ---@param cb fun(ok: boolean|nil, err: string|nil, meta: table|nil)
