@@ -18,25 +18,22 @@ function Panel.actions()
             scope = "reader",
             available = function(ctx)
                 local ui = ctx and ctx.ui
-                -- 没有 ui（设置页预览）→ 允许
                 if not ui then return true end
                 local cur = require("reader.session").current()
-                -- 是订阅文章 → 不允许
                 if cur and cur.identity and cur.identity.ephemeral then
                     return false
                 end
                 return true
             end,
             run = function(ctx)
-                require("features/reviews.link").Bind.open(ctx.ui)
+                require("features.reviews.link").Bind.open(ctx.ui)
             end,
         },
         {
             id = "reviews_link_switch",
-            title = _("拉取微信评论"), 
+            title = _("拉取微信评论"), -- 改成了你要求的名字
             icon = "forum",
             scope = "reader",
-            -- ★ 拉取动作：保留原有对排版引擎的限制（PDF 不支持，所以灰掉）
             available = function(ctx)
                 local ui = ctx and ctx.ui
                 return not ui or require("features.reviews.linked").supported(ui.document)
@@ -48,6 +45,42 @@ function Panel.actions()
             end,
             run = function(ctx)
                 require("features.reviews.link").openPull(ctx.ui)
+            end,
+        },
+        {
+            id = "reviews_show",
+            title = _("显示段评"), -- ★ 补回来了！
+            icon = "forum",
+            scope = "reader",
+            keep_open = true,
+            available = function(ctx)
+                local ui = ctx and ctx.ui
+                if not ui then return true end
+                local cur = require("reader.session").current()
+                local identity = cur and cur.identity
+                if not identity or identity.ephemeral then return false end
+                local source = identity.source
+                if not source then return false end
+                -- 只有支持段评能力的源才显示这个开关（如微信、番茄）
+                return source.chapterReviewHotspotsAsync ~= nil or source.paragraphHotspotsAsync ~= nil
+            end,
+            active = function(ctx)
+                local cur = require("reader.session").current()
+                local identity = cur and cur.identity
+                if not identity or not identity.source then return false end
+                return identity.source:paragraphReviewsEnabled()
+            end,
+            run = function(ctx)
+                local cur = require("reader.session").current()
+                local identity = cur and cur.identity
+                if not identity or not identity.source then return end
+                local source = identity.source
+                local enabled = source:paragraphReviewsEnabled()
+                require("source.review_setting").set(source.id, not enabled)
+                local ui = ctx.ui
+                if ui and ui.dialog then
+                    require("ui/uimanager"):setDirty(ui.dialog, "ui")
+                end
             end,
         },
     }
