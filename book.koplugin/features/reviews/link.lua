@@ -169,14 +169,14 @@ function Link.open(ui)
     Bind.open(ui)
 end
 
---- 判断当前文档能否绑定。
----@param ui table
+--- 当前文档能否关联微信读书书目。
+--- 只要求有身份且不是订阅文章，不再依赖排版引擎（PDF 等也能绑定上报时长）。
+---@param ui table ReaderUI
 ---@return boolean
 function Link.available(ui)
-    local identity = require("reader.session").current()
-    if not identity or not identity.identity then return false end
-    if identity.identity.ephemeral then return false end
-    return require("features.reviews.linked").supported(ui.document)
+    local identity = identityOf()
+    if not identity or identity.ephemeral then return false end
+    return true
 end
 
 Link.Bind = Bind
