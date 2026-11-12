@@ -31,7 +31,7 @@ function Panel.actions()
         },
         {
             id = "reviews_link_switch",
-            title = _("拉取微信评论"), -- 改成了你要求的名字
+            title = _("拉取微信评论"), 
             icon = "forum",
             scope = "reader",
             available = function(ctx)
