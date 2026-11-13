@@ -386,7 +386,7 @@ local BUBBLE_SCALE = 0.55
 ---@param tail number 尖角伸出长度
 local function paintBubbleShape(bb, x, y, w, h, radius, tail)
     local Blitbuffer = require("ffi/blitbuffer")
-    local dark = 0x88
+    local dark = 0x55
     local cx, cy = x + w / 2, y + h / 2
     local hx, hy = w / 2 - radius, h / 2 - radius
     local bw, bh = bb:getWidth(), bb:getHeight()
@@ -419,10 +419,9 @@ local function bubble(bb, box, text, body_size)
     local label = require("ui/widget/textwidget"):new{
         text = text,
         face = require("ui/font"):getFace("cfont", math.max(6, math.floor(body_size and body_size * BUBBLE_SCALE or box.h * 0.2))),
-        fgcolor = require("ffi/blitbuffer").Color8(0x88),
+        fgcolor = require("ffi/blitbuffer").Color8(0x55),
     }
     local size = label:getSize()
-    -- 数字字形只占文本框的 0.165~0.67（中心在 0.42），按字形而不是文本框居中
     local glyph = math.floor(size.h * 0.505 + 0.5)
     local pad = math.max(3, math.floor(glyph * 0.45))
     local w, h = size.w + pad * 2, glyph + pad * 2
@@ -432,7 +431,10 @@ local function bubble(bb, box, text, body_size)
     local cy = box.y + math.floor(box.h / 2)
     local y = cy - math.floor(h / 2)
     paintBubbleShape(bb, x, y, w, h, radius, tail)
-    label:paintTo(bb, x + pad, cy - math.floor(size.h * 0.42 + 0.5))
+    -- 文本框比字形高，字形在文本框里偏上，直接按框居中会让字形偏下；
+    -- 用字形中心对齐气泡框中心。
+    local text_y = y + math.floor((h - glyph) / 2) - math.floor(size.h * 0.22)
+    label:paintTo(bb, x + pad, text_y)
     label:free()
     return { x = x - tail, y = y, w = w + tail, h = h }
 end
