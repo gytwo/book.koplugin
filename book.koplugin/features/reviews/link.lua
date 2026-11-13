@@ -307,19 +307,19 @@ end
 
 -- ── 段评开关 ───────────────────────────────────────────────
 
---- 切换「拉取段评」开关（全局）。
+--- 切换「拉取微信段评」开关。只影响微信，番茄有自己的开关。
 ---@param ui table
 function Link.openPull(ui)
     local book = Bind.get(ui)
-    if not book or (not book.wechat and not book.fanqie) then
-        toast(_("请先关联书源"))
+    if not book or not book.wechat then
+        toast(_("请先关联微信读书"))
         Bind.open(ui)
         return
     end
     local Linked = require("features.reviews.linked")
-    local on = Linked.enabled(ui)
+    local on = Linked.enabled(ui, "wechat")
     ui.doc_settings:saveSetting("book_reviews_wechat", not on)
-    toast(on and _("已关闭段评") or _("已开启段评"))
+    toast(on and _("已关闭微信评论") or _("已开启微信评论"))
     UIManager:setDirty(ui.dialog, "ui")
 end
 
