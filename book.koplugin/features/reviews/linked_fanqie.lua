@@ -1,5 +1,5 @@
 --[[--
-本地书匹配番茄段评。
+本地书匹配番茄段评。照独立插件 local_review.lua 的逻辑。
 
 @module koplugin.book.features.reviews.linked_fanqie
 --]]
@@ -178,7 +178,14 @@ local function startScan(ui, hotspots, lines, cache, redraw, page, scan_key, on_
             local pos, pages = {}, {}
             for i, p in pairs(result) do
                 local spot = hotspots[tonumber(i)]
-                if spot and type(p) == "table" then pos[spot.range] = p end
+                if spot and type(p) == "table" then
+                    -- 从本章正文回填，与在线番茄源 locate 的行为一致（不截断）
+                    if spot.text == "" then
+                        local pid = tonumber(spot.range:match("(%d+)$"))
+                        spot.text = (pid and lines[pid]) or spot.text
+                    end
+                    pos[spot.range] = p
+                end
             end
             if located > 0 or #hotspots == 0 then
                 cache.fanqie_results[scan_key] = { pos = pos, pages = pages }
@@ -191,7 +198,6 @@ local function startScan(ui, hotspots, lines, cache, redraw, page, scan_key, on_
                 cache.fanqie_failed = cache.fanqie_failed or {}
                 cache.fanqie_failed[scan_key] = os.time()
             end
-            cache.chapter_text[tonumber(scan_key)] = nil
         end
         if on_done then pcall(on_done, aborted == true, located) end
         if not aborted and located > 0 and cache.fanqie_local_current == scan_key then
@@ -497,10 +503,18 @@ function M.target(ui, link, cache, redraw)
                 end
             end
 
+            -- 兜底回填：place 时按 item_id 从章节正文补 text，保证 entry.spot.text 有原文
+            local lines = cache.chapter_text[item_id]
             local out = {}
             for _, spot in ipairs(cache.hotspots[item_id] or {}) do
                 local pos = cache.pos[spot.range]
                 if pos then
+                    if (spot.text == nil or spot.text == "") and lines then
+                        local pid = tonumber(spot.range:match("(%d+)$"))
+                        if pid and lines[pid] then
+                            spot.text = lines[pid]
+                        end
+                    end
                     local span = cache.pages[spot.range]
                     if not span then
                         span = {
