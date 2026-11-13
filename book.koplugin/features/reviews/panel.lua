@@ -12,8 +12,8 @@ local Panel = {}
 function Panel.actions()
     return {
         {
-            id = "wechat_bind",
-            title = _("关联微信读书"),
+            id = "review_bind",
+            title = _("关联书源"),
             icon = "link",
             scope = "reader",
             available = function(ctx)
@@ -48,8 +48,33 @@ function Panel.actions()
             end,
         },
         {
+            id = "fanqie_reviews_switch",
+            title = _("拉取番茄段评"),
+            icon = "forum",
+            scope = "reader",
+            keep_open = true,
+            available = function(ctx)
+                local ui = ctx and ctx.ui
+                if not ui then return true end
+                local book = require("features.reviews.linked").get(ui)
+                return book ~= nil and book.fanqie ~= nil
+            end,
+            active = function(ctx)
+                local ui = ctx and ctx.ui
+                if not ui or not ui.doc_settings then return false end
+                return ui.doc_settings:readSetting("fanqie_reviews_enabled") ~= false
+            end,
+            run = function(ctx)
+                local ui = ctx.ui
+                if not ui or not ui.doc_settings then return end
+                local on = ui.doc_settings:readSetting("fanqie_reviews_enabled") ~= false
+                ui.doc_settings:saveSetting("fanqie_reviews_enabled", not on)
+                require("ui/uimanager"):setDirty(ui.dialog, "ui")
+            end,
+        },
+        {
             id = "reviews_show",
-            title = _("显示段评"), -- ★ 补回来了！
+            title = _("显示段评"), 
             icon = "forum",
             scope = "reader",
             keep_open = true,
