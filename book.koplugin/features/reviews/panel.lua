@@ -41,7 +41,7 @@ function Panel.actions()
             keep_open = true,
             active = function(ctx)
                 local ui = ctx and ctx.ui
-                return ui ~= nil and require("features.reviews.linked").enabled(ui)
+                return ui ~= nil and require("features.reviews.linked").enabled(ui, "wechat")
             end,
             run = function(ctx)
                 require("features.reviews.link").openPull(ctx.ui)
@@ -69,6 +69,10 @@ function Panel.actions()
                 if not ui or not ui.doc_settings then return end
                 local on = ui.doc_settings:readSetting("fanqie_reviews_enabled") ~= false
                 ui.doc_settings:saveSetting("fanqie_reviews_enabled", not on)
+                require("ui.themes.widgets.toast"):new{
+                    text = on and _("已关闭番茄段评") or _("已开启番茄段评"),
+                    timeout = 2,
+                }:show()
                 require("ui/uimanager"):setDirty(ui.dialog, "ui")
             end,
         },
