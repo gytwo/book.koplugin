@@ -471,6 +471,32 @@ end
 -- 番茄正文接口有设备风控，预取与整本下载都按这个间隔逐章请求。
 local FETCH_INTERVAL = 6
 
+--- 拉单章正文（给本地书匹配段评用）。
+---@param identity BookIdentity
+---@param chapter table { uid = ... } 或 { itemId = 章序号 }
+---@param cb fun(result: table|nil, err: string|nil)
+---@return { cancel: fun() }
+function Source:fetchChapterAsync(identity, chapter, cb)
+    if chapter.uid then
+        return fetch(self, identity, { uid = chapter.uid }, cb)
+    end
+    local idx = tonumber(chapter.itemId or identity.chapter_idx)
+    if not idx then
+        return Base.defer(cb, nil, "缺少章节序号")
+    end
+    local h = handle()
+    h.job = self:loadTocAsync(identity, function(toc, err)
+        if h.cancelled then return end
+        local ch = toc and toc[idx]
+        if not ch or not ch.uid then
+            cb(nil, err or "番茄目录缺少该章")
+            return
+        end
+        h.job = fetch(self, identity, { uid = ch.uid }, cb)
+    end)
+    return h
+end
+
 ---@return ChapterFetchContent
 local function contentFetcher(self)
     return function(ref, ch, done) return fetch(self, ref, ch, done) end
