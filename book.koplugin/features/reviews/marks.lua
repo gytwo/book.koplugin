@@ -319,11 +319,7 @@ local function currentTarget(self)
         return chapterTarget(self, identity, wechat)
     end
     -- 👇👇👇 就是改这里 👇👇👇
-    -- 本地书：先看段评开关（旧键）是否打开，没打开就直接返回 nil，不渲染
-    if not Linked.enabled(self.ui) then
-        return nil
-    end
-    -- 开关打开了，再去读新键的绑定书号，拉取并渲染
+    -- 本地书：各源在 Linked.target 内按自己的开关判断，互不牵连
     return Linked.target(self.ui, self.cache, function() redraw(self) end)
 end
 
