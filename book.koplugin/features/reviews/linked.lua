@@ -1,18 +1,10 @@
 --[[--
-关联书段评：非微信读书的本地书（排版引擎能打开的格式：EPUB、AZW3、TXT、FB2、HTML…）关联一本微信读书书目后，借用它的段评。
+关联书段评：本地书关联微信读书 / 番茄书目，借用它们的段评。
 
-关联存在 KOReader 书籍 sidecar（``doc_settings`` 的 ``book_reviews_wechat``），跟着文件走，不进库。
-
-两个版本的分章常常对不上（本地「第三章」可能是微信「二」的开头），所以不认章号，按内容找：
-当前页在全书的位置 ↔ 微信各章按字数累计的区间，取附近的章（两侧留 ``MARGIN``），
-再加上当前目录标题对得上的章，最多 ``MAX_CHAPTERS`` 章。各章热点原句后台拉取（源侧有磁盘缓存），
-拉到一章就重画一次。
-
-找句（扫一页）：取前一页、本页、后一页的文字，去空白标点后找原句（跨页的句子也能找全），
-只认窗口内唯一且与本页重叠的命中，再用命中的原文交排版引擎 ``findText`` 换成 xpointer。
-xpointer 与排版无关，找到一次一直有效。扫一页在 Kindle 上要一两百毫秒，不能放在每次翻页里：
-当前页没扫过才在绘制时扫，后 ``AHEAD`` 页在空闲 ``IDLE`` 秒后逐页预扫（``findText`` 从当前页往后搜两页，够得着）。
-绘制只按页码筛出已定位的句子取屏幕框（页码随排版变，按排版指纹缓存）。
+review_book = { wechat = {...}, fanqie = {...} }，两个源可同时绑。
+- wechat：按原句文字定位（squash + findText）。
+- fanqie：按段落 pid 定位（linked_fanqie.lua）。
+- 兼容旧键 wechat_book（无 source 字段，视为 wechat）。
 
 @module koplugin.book.features.reviews.linked
 --]]
@@ -23,80 +15,72 @@ local logger = require("utils.log")
 
 local Linked = {}
 
-local KEY = "book_reviews_wechat"
 --- 一页最多去对的微信章数（每章要发 1 + 热点数/40 个请求）。
 local MAX_CHAPTERS = 6
 --- 比例对齐的余量（全书比例）。
 local MARGIN = 0.05
 --- 太短的原句（去标点后不足 4 个汉字）到处都能撞上，不标。
 local MIN_BYTES = 12
---- 某章拉取失败后多久再试（秒）：离线、网络抖动后能自己恢复，又不会每次翻页都打一次请求。
+--- 某章拉取失败后多久再试（秒）。
 local RETRY = 60
---- 翻页后多久预扫（秒）：等翻页刷新完，不跟它抢。
+--- 翻页后多久预扫（秒）。
 local IDLE = 0.3
---- 往后预扫几页：findText 从当前页往后只搜两页高。
+--- 往后预扫几页。
 local AHEAD = 2
 
 ---@class ReviewLink
----@field book_id string 微信读书 bookId
+---@field source string "wechat" | "fanqie"
+---@field book_id string
 ---@field title string|nil
 ---@field author string|nil
 
---- 一条段评热点：identity 是该句所属的微信章身份（点按开段评用）。
----@class ReviewEntry
----@field identity BookIdentity
----@field spot WechatReviewHotspot
-
---- 屏上一处段评：句子与它在本屏的框。
----@class ReviewPlacement
----@field entry ReviewEntry
----@field boxes table[]
-
---- 关联书各微信章热点与在飞拉取，归阅读页（每个 ReaderUI 一份），跨书目复用。
----@class ReviewLinkCache
----@field hotspots table<string, WechatReviewHotspot[]> 「bookId\0章 uid」→ 热点
----@field loading table<string, { cancel: fun() }|integer> 在飞句柄，或失败时刻（秒）
----@field pos table<WechatReviewHotspot, string[]> 已定位的原句 { pos0, pos1 }
----@field pages table<WechatReviewHotspot, integer[]> 已定位原句的 { 起页, 止页 }（随排版失效）
----@field scanned table<integer, integer> 页 → 扫它时的热点数（热点多了要重扫；随排版失效）
----@field hash integer|nil pages / scanned 对应的排版指纹
----@field timer function|nil 待执行的下一页预扫
----@field job { job: { cancel: fun() }, page: integer }|nil 在飞的扫页子进程
----@field logged table<WechatReviewHotspot, boolean> 已记过「对不上」日志的原句
-
---- 读关联（统一读新键 `wechat_book`）。
+--- 读关联。
 ---@param ui table ReaderUI
----@return ReviewLink|nil
---- 读关联（统一读新键 `wechat_book`）。
----@param ui table ReaderUI
----@return ReviewLink|nil
-function Linked.get(ui)
+---@param source_id string|nil 指定源；nil 返回 { wechat = {...}, fanqie = {...} }
+---@return table|nil
+function Linked.get(ui, source_id)
     if not ui.doc_settings then return nil end
-    return ui.doc_settings:readSetting("wechat_book")
+    local book = ui.doc_settings:readSetting("review_book")
+    if type(book) ~= "table" then book = {} end
+    -- 兼容旧 wechat_book
+    if not book.wechat then
+        local old = ui.doc_settings:readSetting("wechat_book")
+        if old then book.wechat = old end
+    end
+    if source_id then return book[source_id] end
+    return book
 end
 
---- 段评开关（旧键 `book_reviews_wechat` 作为布尔开关）。
+---@param ui table ReaderUI
+---@param source_id string
+---@param link ReviewLink|nil nil = 解除该源关联
+function Linked.set(ui, source_id, link)
+    if not ui.doc_settings then return end
+    local book = ui.doc_settings:readSetting("review_book")
+    if type(book) ~= "table" then book = {} end
+    book[source_id] = link
+    ui.doc_settings:saveSetting("review_book", book)
+end
+
+--- 段评开关：绑了任一源默认开，否则按旧键。
 ---@param ui table ReaderUI
 ---@return boolean
 function Linked.enabled(ui)
     if not ui.doc_settings then return false end
+    local book = ui.doc_settings:readSetting("review_book")
+    if type(book) == "table" and (book.wechat or book.fanqie) then
+        return ui.doc_settings:readSetting("book_reviews_wechat") ~= false
+    end
     local val = ui.doc_settings:readSetting("book_reviews_wechat")
-    
-    -- 兼容旧版数据：以前这里存的是 table（包含 book_id 等）
     if type(val) == "table" then
-        -- 顺手把书号迁移到新键（如果新键还没值的话）
         if val.book_id and not ui.doc_settings:readSetting("wechat_book") then
             ui.doc_settings:saveSetting("wechat_book", {
-                book_id = val.book_id,
-                title = val.title,
-                author = val.author,
+                book_id = val.book_id, title = val.title, author = val.author,
             })
         end
-        -- 旧键覆盖成布尔开关，默认开启（因为老用户以前存 table 就是为了看段评）
         ui.doc_settings:saveSetting("book_reviews_wechat", true)
         return true
     end
-    
     return val == true
 end
 
@@ -109,7 +93,21 @@ end
 
 ---@return ReviewLinkCache
 function Linked.newCache()
-    return { hotspots = {}, loading = {}, pos = {}, pages = {}, scanned = {}, logged = {} }
+    return {
+        hotspots = {}, loading = {}, pos = {}, pages = {}, scanned = {},
+        logged = {}, chapter_text = {},
+        fanqie_results = {},
+        fanqie_prefetching = {},
+        fanqie_prefetched = {},
+        fanqie_queue = {},
+        fanqie_queue_active = false,
+        fanqie_current = nil,
+        fanqie_local_current = nil,
+        fanqie_failed = {},
+        fanqie_job = nil,
+        scan_key = nil,
+        scan_done = nil,
+    }
 end
 
 --- 取消在飞拉取与预扫（已拉到的热点、已定位的原句保留）。
@@ -120,9 +118,16 @@ function Linked.cancel(cache)
         cache.timer = nil
     end
     if cache.job then
-        cache.job.job:cancel()
+        if cache.job.job then cache.job.job:cancel() end
         cache.job = nil
     end
+    -- 番茄源：取消在飞扫描 + 清预取队列
+    if cache.fanqie_job then
+        cache.fanqie_job:cancel()
+        cache.fanqie_job = nil
+    end
+    cache.fanqie_queue = {}
+    cache.fanqie_queue_active = false
     for key, job in pairs(cache.loading) do
         if type(job) == "table" then job.cancel() end
         cache.loading[key] = nil
@@ -132,17 +137,11 @@ end
 local CJK_PUNCT = {
     "　", "，", "。", "：", "；", "、", "！", "？", "“", "”", "‘", "’",
     "《", "》", "（", "）", "【", "】", "·", "—", "…", "「", "」", "『", "』", "～",
-    "\226\128\139", "\239\187\191", -- 零宽空格、BOM：微信原句里常夹着
+    "\226\128\139", "\239\187\191",
 }
 local PUNCT = {}
 for _idx, p in ipairs(CJK_PUNCT) do PUNCT[p] = true end
 
---- 去空白标点：两个版本标点、空格常有出入，比文字本身。
---- 同时记下每个保留字在去后串里的字节位置 → 原文字节区间，命中后能截回原文。
----@param raw string
----@return string squashed
----@return table<integer, integer> from 去后串字符首字节 → 原文起点
----@return table<integer, integer> to 去后串字符末字节 → 原文终点
 local function squash(raw)
     local parts, from, to, n = {}, {}, {}, 0
     for s, ch, e in raw:gmatch("()(" .. require("utils.text").UTF8_CHAR .. ")()") do
@@ -161,10 +160,6 @@ local DIGITS = { ["零"] = 0, ["〇"] = 0, ["一"] = 1, ["二"] = 2, ["两"] = 2
     ["五"] = 5, ["六"] = 6, ["七"] = 7, ["八"] = 8, ["九"] = 9 }
 local UNITS = { ["十"] = 10, ["百"] = 100, ["千"] = 1000 }
 
---- 开头的中文数字 → 整数与余下部分（一百零五 = 105，十二 = 12，一九八四 = 1984）；不以中文数字开头返回 nil。
---- 这些字都是 3 字节 UTF-8，逐字比对，不能用字节字符类。
----@param s string
----@return integer|nil, string|nil
 local function leadingNumber(s)
     local total, digit, pos = 0, nil, 1
     while true do
@@ -183,10 +178,6 @@ local function leadingNumber(s)
     return total + (digit or 0), s:sub(pos)
 end
 
---- 归一化章名：去空白标点；开头的「第 N 章 / 回 / 节」与裸中文序号统一成阿拉伯数字
---- （本地「第一章」与微信「一」都成 1）。部、卷、篇保留，免得与章撞号。
----@param title string|nil
----@return string
 local function norm(title)
     local s = squash(tostring(title or "")):gsub("^第", "")
     local num, rest = s:match("^(%d+)(.*)$")
@@ -196,10 +187,6 @@ local function norm(title)
     return tostring(tonumber(num)) .. rest
 end
 
---- 第 page 页所在的本地目录标题：每一层取页码不超过 page 的最后一项（章、节各一个）。
----@param toc table[] document:getToc()（带 page、depth）
----@param page integer
----@return string[]
 function Linked.titlesAt(toc, page)
     local by_depth = {}
     for _idx, item in ipairs(toc) do
@@ -212,10 +199,6 @@ function Linked.titlesAt(toc, page)
     return out
 end
 
---- 章名或章内小节名归一化后满足 test 的微信章。
----@param chapters BookChapter[]
----@param test fun(name: string): boolean
----@return BookChapter[]
 local function find(chapters, test)
     local out = {}
     for _idx, chapter in ipairs(chapters) do
@@ -228,18 +211,10 @@ local function find(chapters, test)
     return out
 end
 
---- a 以 b 开头，且不是把数字从中间截开（1 不算 10 的前缀）。
----@param a string
----@param b string
----@return boolean
 local function startsWith(a, b)
     return #a > #b and a:sub(1, #b) == b and not (b:match("%d$") and a:sub(#b + 1, #b + 1):match("%d"))
 end
 
---- 本地标题 → 微信章：先比全等，没有再比前缀（一方是另一方开头），只认唯一命中。
----@param chapters BookChapter[] 微信目录
----@param titles string[]
----@return BookChapter[] 按标题顺序、去重
 function Linked.byTitle(chapters, titles)
     local out, seen = {}, {}
     for _idx, title in ipairs(titles) do
@@ -261,12 +236,6 @@ function Linked.byTitle(chapters, titles)
     return out
 end
 
---- 全书位置 at（0..1）要去对的微信章：标题对上的在前，其余按字数比例落在 at ± MARGIN 内、离 at 近的在前。
----@param chapters BookChapter[] 微信目录（带 words）
----@param titles string[] 当前页的本地目录标题
----@param at number
----@param limit integer|nil 候选章上限，默认 MAX_CHAPTERS
----@return BookChapter[]
 function Linked.candidates(chapters, titles, at, limit)
     local out, seen = {}, {}
     for _idx, chapter in ipairs(Linked.byTitle(chapters, titles)) do
@@ -292,12 +261,6 @@ function Linked.candidates(chapters, titles, at, limit)
     return out
 end
 
---- 第 p 页的文字。最后一页没有「下一页起点」可截，只在它就是当前屏时取屏幕文字。
----@param ui table
----@param p integer
----@param page integer 当前页
----@param count integer 总页数
----@return string
 local function pageText(ui, p, page, count)
     local document = ui.document
     if p < 1 or p > count then return "" end
@@ -310,13 +273,6 @@ local function pageText(ui, p, page, count)
     return range and range.text or ""
 end
 
---- 扫第 p 页（在子进程里跑：要访问排版引擎，只读，结果经 JSON 回主进程）：
---- 前一页 + 本页 + 后一页文字里找未定位的原句，唯一且与本页重叠的交 findText 换成 xpointer。
----@param ui table ReaderUI
----@param entries ReviewEntry[]
----@param cache ReviewLinkCache
----@param p integer
----@return { found: table<integer, string[]>, why: table<integer, string> } 按热点序号
 local function scan(ui, entries, cache, p)
     local document = ui.document
     local page, count = PageMarks.currentPage(ui), document:getPageCount()
@@ -327,7 +283,7 @@ local function scan(ui, entries, cache, p)
     local result = { found = {}, why = {} }
     for i, entry in ipairs(entries) do
         local spot = entry.spot
-        local needle = squash(spot.text)
+        local needle = squash(spot.text or "")
         local s, e = nil, nil
         if not cache.pos[spot] and #needle >= MIN_BYTES then s, e = text:find(needle, 1, true) end
         if s and from[s] <= cur1 and to[e] >= cur0 then
@@ -343,7 +299,6 @@ local function scan(ui, entries, cache, p)
                 if not result.found[i] then result.why[i] = "findText miss" end
             end
         elseif not s and not cache.pos[spot] and #needle >= MIN_BYTES then
-            -- 开头对上、整句对不上：两版文字有出入（错字、增删），记下好比对。
             local hs = text:find(needle:sub(1, MIN_BYTES), 1, true)
             if hs and from[hs] <= cur1 then result.why[i] = "differs" end
         end
@@ -351,18 +306,9 @@ local function scan(ui, entries, cache, p)
     return result
 end
 
---- 收下一页的扫描结果。排版已变（指纹对不上）的只收 xpointer（与排版无关），不记「已扫」。
----@param entries ReviewEntry[]
----@param cache ReviewLinkCache
----@param p integer
----@param hash integer
----@param result { found: table<integer, string[]>, why: table<integer, string> }|nil nil = 子进程失败
----@return integer 新定位的句子数
 local function apply(entries, cache, p, hash, result)
     result = result or { found = {}, why = {} }
     local located = 0
-    -- 子进程结果走 JSON，稀疏的热点序号回来是字符串键
-    -- 序号稀疏时 rapidjson 编成数组，空位解成 json.null（函数值），只收 xpointer 对。
     for key, pos in pairs(result.found) do
         if type(pos) == "table" then
             cache.pos[entries[tonumber(key)].spot] = pos
@@ -373,25 +319,16 @@ local function apply(entries, cache, p, hash, result)
         local spot = entries[tonumber(key)].spot
         if not cache.logged[spot] then
             cache.logged[spot] = true
-            logger.info("book.reviews unmatched", why, "page", p, "quote", spot.text)
         end
     end
-    -- 失败也记已扫：否则每次重绘都再开一个必败的子进程。
     if cache.hash == hash then cache.scanned[p] = #entries end
     return located
 end
 
---- 起一个子进程扫第 p 页，同一时刻只有一个；扫完收下结果，有新定位就重画，再排后几页的预扫。
----@param ui table ReaderUI
----@param entries ReviewEntry[]
----@param cache ReviewLinkCache
----@param p integer
----@param page integer 当前页
----@param redraw fun()
 local function startScan(ui, entries, cache, p, page, redraw)
     if cache.job then
         if cache.job.page == p then return end
-        cache.job.job:cancel()
+        if cache.job.job then cache.job.job:cancel() end
         cache.job = nil
     end
     local hash = cache.hash
@@ -399,7 +336,6 @@ local function startScan(ui, entries, cache, p, page, redraw)
         cache.job = nil
         if not ui.document then return end
         if apply(entries, cache, p, hash, result) > 0 then redraw() end
-        -- 翻走了就不接着排旧页的预扫，下次绘制会重排。
         if PageMarks.currentPage(ui) == page then Linked.scheduleScan(ui, entries, cache, page, redraw) end
     end
     local job = require("workers.job").run(function() return scan(ui, entries, cache, p) end, {
@@ -415,12 +351,6 @@ local function startScan(ui, entries, cache, p, page, redraw)
     if not job.settled then cache.job = { job = job, page = p } end
 end
 
---- 空闲后逐页预扫当前页之后 AHEAD 页里没扫过的；视口变了（翻页、关书）就作废。
----@param ui table ReaderUI
----@param entries ReviewEntry[]
----@param cache ReviewLinkCache
----@param page integer 当前页
----@param redraw fun()
 function Linked.scheduleScan(ui, entries, cache, page, redraw)
     if cache.timer then UIManager:unschedule(cache.timer) end
     cache.timer = nil
@@ -437,12 +367,6 @@ function Linked.scheduleScan(ui, entries, cache, page, redraw)
     UIManager:scheduleIn(IDLE, cache.timer)
 end
 
---- 当前屏的段评：当前页没扫过先后台扫（扫完重画），再按页码筛出已定位的句子取屏幕框；之后排后几页的预扫。
----@param ui table ReaderUI
----@param entries ReviewEntry[]
----@param cache ReviewLinkCache
----@param redraw fun() 新定位了句子，重画
----@return ReviewPlacement[]
 function Linked.place(ui, entries, cache, redraw)
     local document = ui.document
     if not PageMarks.canMapXPointers(document) then
@@ -456,7 +380,6 @@ function Linked.place(ui, entries, cache, redraw)
     if cache.scanned[page] ~= #entries then
         startScan(ui, entries, cache, page, page, redraw)
     end
-    -- 双栏、滚动模式一屏最多跨两页。
     local width, height = PageMarks.screenSize(ui)
     local out = {}
     for _idx, entry in ipairs(entries) do
@@ -478,14 +401,6 @@ function Linked.place(ui, entries, cache, redraw)
     return out
 end
 
---- 当前页附近微信章的热点；还没拉的发起后台拉取（拉到后 redraw），失败的过 RETRY 秒再试。
----@param ui table
----@param source ParagraphReviewSource
----@param book_id string
----@param toc BookChapter[]
----@param cache ReviewLinkCache
----@param redraw fun()
----@return ReviewEntry[]
 function Linked.entries(ui, source, book_id, toc, cache, redraw)
     local document = ui.document
     local page = PageMarks.currentPage(ui)
@@ -508,7 +423,6 @@ function Linked.entries(ui, source, book_id, toc, cache, redraw)
                 end
                 cache.loading[key] = nil
                 cache.hotspots[key] = fetched
-                logger.info("book.reviews chapter", chapter.idx, chapter.title, "hotspots", #fetched)
                 redraw()
             end)
             if not done then cache.loading[key] = job end
@@ -517,11 +431,6 @@ function Linked.entries(ui, source, book_id, toc, cache, redraw)
     return entries
 end
 
---- 关联的微信目录；旧格式目录没有章节字数，强制重拉一次。
----@param source ParagraphReviewSource
----@param book_id string
----@param cb fun(toc: BookChapter[]|nil, err: string|nil)
----@return { cancel: fun() }
 function Linked.tocAsync(source, book_id, cb)
     local book = { source_id = source.id, stable_id = book_id }
     local job
@@ -537,23 +446,65 @@ function Linked.tocAsync(source, book_id, cb)
     end }
 end
 
---- 关联书的段评目标：键只认书目；fetch 拉微信目录，place 按当前页拉章、找句、取框。
+--- 关联书的段评目标：两个源各自产出 placement，合并返回。
 ---@param ui table ReaderUI
 ---@param cache ReviewLinkCache
----@param redraw fun() 某章热点到了，重画
----@return { key: string, fetch: fun(cb: fun(toc: BookChapter[]|nil, err: string|nil)): { cancel: fun() }, place: fun(toc: BookChapter[]): ReviewPlacement[] }|nil
+---@param redraw fun()
+---@return table|nil
 function Linked.target(ui, cache, redraw)
-    local link = Linked.get(ui)
-    if not (link and Linked.supported(ui.document)) then return nil end
-    local source = require("source.registry").resolve("wechat") --[[@as ParagraphReviewSource]]
-    if not source:configured() then return nil end
-    -- 本地书不看微信源全局开关，只看自己的“拉取微信段评”开关（旧键）
-    if not require("features.reviews.linked").enabled(ui) then return nil end
+    local book = Linked.get(ui)
+    logger.info("book.reviews target", "fanqie=" .. tostring(book and book.fanqie ~= nil),
+        "wechat=" .. tostring(book and book.wechat ~= nil))
+    if not Linked.supported(ui.document) then return nil end
+    if not Linked.enabled(ui) then return nil end
+    local book = Linked.get(ui)
+    if type(book) ~= "table" then return nil end
+
+    local targets = {}
+    if book.fanqie then
+        local t = require("features.reviews.linked_fanqie").target(ui, book.fanqie, cache, redraw)
+        if t then targets[#targets + 1] = t end
+    end
+    if book.wechat then
+        local source = require("source.registry").resolve("wechat")
+        if source and source:configured() then
+            targets[#targets + 1] = {
+                key = "wechat\0" .. book.wechat.book_id,
+                fetch = function(cb) return Linked.tocAsync(source, book.wechat.book_id, cb) end,
+                place = function(toc)
+                    return Linked.place(ui, Linked.entries(ui, source, book.wechat.book_id, toc, cache, redraw), cache, redraw)
+                end,
+            }
+        end
+    end
+
+    if #targets == 0 then return nil end
+    if #targets == 1 then return targets[1] end
+
     return {
-        key = "link\0" .. link.book_id,
-        fetch = function(cb) return Linked.tocAsync(source, link.book_id, cb) end,
-        place = function(toc)
-            return Linked.place(ui, Linked.entries(ui, source, link.book_id, toc, cache, redraw), cache, redraw)
+        key = table.concat({ targets[1].key, targets[2].key }, "\0"),
+        fetch = function(cb)
+            local results, pending = {}, #targets
+            local jobs, cancelled = {}, false
+            for i, t in ipairs(targets) do
+                jobs[i] = t.fetch(function(data, err)
+                    if cancelled then return end
+                    results[i] = data
+                    pending = pending - 1
+                    if pending == 0 then cb(results) end
+                end)
+            end
+            return { cancel = function()
+                cancelled = true
+                for _, j in ipairs(jobs) do if j and j.cancel then j.cancel() end end
+            end }
+        end,
+        place = function(data)
+            local out = {}
+            for i, t in ipairs(targets) do
+                for _, p in ipairs(t.place(data[i])) do out[#out + 1] = p end
+            end
+            return out
         end,
     }
 end
@@ -564,17 +515,12 @@ local function linkKey(identity)
     return tostring(identity.source_id or "") .. "\0" .. tostring(identity.stable_id)
 end
 
---- 章会话的关联：每章是一个独立文档，doc_settings 一章一份存不住，按书存进 settings/reviews.lua 的 chapter_links。
----@param identity BookIdentity
----@return ReviewLink|nil
 function Linked.getFor(identity)
     if not (identity and identity.stable_id) then return nil end
     local links = require("utils.settings").get("features.reviews").chapter_links or {}
     return links[linkKey(identity)]
 end
 
----@param identity BookIdentity
----@param link ReviewLink|nil nil = 解除关联
 function Linked.setFor(identity, link)
     if not (identity and identity.stable_id) then return end
     local MoonSettings = require("utils.settings")
@@ -584,11 +530,6 @@ function Linked.setFor(identity, link)
     MoonSettings.save("features.reviews", data)
 end
 
---- 本章在全书的位置比例（按 words 累计取章中点；目录没有字数时按章序号）与章名。
----@param chapters BookChapter[]|nil
----@param chapter_idx number|nil
----@return number at 0..1
----@return string|nil title
 function Linked.anchorOf(chapters, chapter_idx)
     chapters = chapters or {}
     local total, acc, title, pos = 0, 0, nil, nil
@@ -602,13 +543,6 @@ function Linked.anchorOf(chapters, chapter_idx)
     return (acc + (chapters[pos].words or 0) / 2) / total, title
 end
 
---- 章会话借关联书目的段评：按本章位置与章名到关联书目录里挑章（最多 8 章），
---- 拉这些章的热点并记上归属章 ``spot.chapter_idx``（未定位，由调用方定位到本章 HTML）。
----@param source ParagraphReviewSource 微信读书源
----@param identity BookIdentity 本章身份（带 chapter_idx 与属主源）
----@param link ReviewLink
----@param cb fun(hotspots: WechatReviewHotspot[]|nil)
----@return { cancel: fun() }
 function Linked.chapterHotspotsAsync(source, identity, link, cb)
     local cancelled, jobs = false, {}
     local function cancel()
@@ -623,7 +557,6 @@ function Linked.chapterHotspotsAsync(source, identity, link, cb)
         jobs[#jobs + 1] = Linked.tocAsync(source, link.book_id, function(remote)
             if cancelled then return end
             if not remote then cb(nil); return end
-            -- 两本书分章对不上时多对几章（章名对上的排在最前）
             local chapters = Linked.candidates(remote, title and { title } or {}, at, 8)
             local collected, pending = {}, #chapters
             if pending == 0 then cb(collected); return end
@@ -633,7 +566,6 @@ function Linked.chapterHotspotsAsync(source, identity, link, cb)
                 }, function(hotspots)
                     if cancelled or pending <= 0 then return end
                     for _spot_idx, spot in ipairs(hotspots or {}) do
-                        -- 段评归属章：翻段评要用这一章的身份，range 才有效
                         spot.chapter_idx = chapter.idx
                         collected[#collected + 1] = spot
                     end
