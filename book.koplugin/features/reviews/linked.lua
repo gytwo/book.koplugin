@@ -114,6 +114,8 @@ function Linked.newCache()
         hotspots = {}, loading = {}, pos = {}, pages = {}, scanned = {},
         logged = {}, chapter_text = {},
         fanqie_results = {},
+        fanqie_pos = {},
+        fanqie_pages = {},
         fanqie_prefetching = {},
         fanqie_prefetched = {},
         fanqie_queue = {},
