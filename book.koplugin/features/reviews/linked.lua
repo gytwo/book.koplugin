@@ -62,15 +62,32 @@ function Linked.set(ui, source_id, link)
     ui.doc_settings:saveSetting("review_book", book)
 end
 
---- 段评开关：绑了任一源默认开，否则按旧键。
+--- 段评开关。传 source_id 只看该源；不传则看"任一源开启"（保留旧语义）。
+--- 微信看 book_reviews_wechat，番茄看 fanqie_reviews_enabled，互不影响。
 ---@param ui table ReaderUI
+---@param source_id "wechat"|"fanqie"|nil
 ---@return boolean
-function Linked.enabled(ui)
+function Linked.enabled(ui, source_id)
     if not ui.doc_settings then return false end
     local book = ui.doc_settings:readSetting("review_book")
-    if type(book) == "table" and (book.wechat or book.fanqie) then
-        return ui.doc_settings:readSetting("book_reviews_wechat") ~= false
+    if type(book) ~= "table" then
+        -- 兼容旧 wechat_book
+        local old = ui.doc_settings:readSetting("wechat_book")
+        if old then book = { wechat = old } else book = {} end
     end
+    local function on(id)
+        if not book[id] then return false end
+        if id == "fanqie" then
+            return ui.doc_settings:readSetting("fanqie_reviews_enabled") ~= false
+        end
+        local val = ui.doc_settings:readSetting("book_reviews_wechat")
+        if type(val) == "table" then return true end
+        return val ~= false
+    end
+    if source_id then return on(source_id) end
+    -- 不传：任一源开启即 true
+    if on("wechat") or on("fanqie") then return true end
+    -- 旧键 book_reviews_wechat 为表、且没有 wechat_book 时迁移（保留原逻辑）
     local val = ui.doc_settings:readSetting("book_reviews_wechat")
     if type(val) == "table" then
         if val.book_id and not ui.doc_settings:readSetting("wechat_book") then
@@ -447,6 +464,7 @@ function Linked.tocAsync(source, book_id, cb)
 end
 
 --- 关联书的段评目标：两个源各自产出 placement，合并返回。
+--- 微信看 book_reviews_wechat，番茄看 fanqie_reviews_enabled，互不影响。
 ---@param ui table ReaderUI
 ---@param cache ReviewLinkCache
 ---@param redraw fun()
@@ -456,16 +474,18 @@ function Linked.target(ui, cache, redraw)
     logger.info("book.reviews target", "fanqie=" .. tostring(book and book.fanqie ~= nil),
         "wechat=" .. tostring(book and book.wechat ~= nil))
     if not Linked.supported(ui.document) then return nil end
-    if not Linked.enabled(ui) then return nil end
-    local book = Linked.get(ui)
     if type(book) ~= "table" then return nil end
 
     local targets = {}
-    if book.fanqie then
+
+    -- 番茄：自己的开关
+    if book.fanqie and Linked.enabled(ui, "fanqie") then
         local t = require("features.reviews.linked_fanqie").target(ui, book.fanqie, cache, redraw)
         if t then targets[#targets + 1] = t end
     end
-    if book.wechat then
+
+    -- 微信：自己的开关（book_reviews_wechat）
+    if book.wechat and Linked.enabled(ui, "wechat") then
         local source = require("source.registry").resolve("wechat")
         if source and source:configured() then
             targets[#targets + 1] = {
