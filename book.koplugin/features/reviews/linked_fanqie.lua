@@ -179,7 +179,6 @@ local function startScan(ui, hotspots, lines, cache, redraw, page, scan_key, on_
             for i, p in pairs(result) do
                 local spot = hotspots[tonumber(i)]
                 if spot and type(p) == "table" then
-                    -- 从本章正文回填，与在线番茄源 locate 的行为一致（不截断）
                     if spot.text == "" then
                         local pid = tonumber(spot.range:match("(%d+)$"))
                         spot.text = (pid and lines[pid]) or spot.text
@@ -190,14 +189,15 @@ local function startScan(ui, hotspots, lines, cache, redraw, page, scan_key, on_
             if located > 0 or #hotspots == 0 then
                 cache.fanqie_results[scan_key] = { pos = pos, pages = pages }
                 if cache.fanqie_local_current == scan_key then
-                    cache.pos = pos
-                    cache.pages = pages
+                    cache.fanqie_pos = pos
+                    cache.fanqie_pages = pages
                     cache.scan_done = true
                 end
             else
                 cache.fanqie_failed = cache.fanqie_failed or {}
                 cache.fanqie_failed[scan_key] = os.time()
             end
+            cache.chapter_text[tonumber(scan_key)] = nil
         end
         if on_done then pcall(on_done, aborted == true, located) end
         if not aborted and located > 0 and cache.fanqie_local_current == scan_key then
@@ -458,12 +458,12 @@ function M.target(ui, link, cache, redraw)
                 cache.scan_key = local_key
                 local cached = cache.fanqie_results[local_key]
                 if cached then
-                    cache.pos = cached.pos
-                    cache.pages = cached.pages
+                    cache.fanqie_pos = cached.pos
+                    cache.fanqie_pages = cached.pages
                     cache.scan_done = true
                 else
-                    cache.pos = {}
-                    cache.pages = {}
+                    cache.fanqie_pos = {}
+                    cache.fanqie_pages = {}
                     cache.scan_done = nil
                 end
             end
@@ -503,11 +503,10 @@ function M.target(ui, link, cache, redraw)
                 end
             end
 
-            -- 兜底回填：place 时按 item_id 从章节正文补 text，保证 entry.spot.text 有原文
             local lines = cache.chapter_text[item_id]
             local out = {}
             for _, spot in ipairs(cache.hotspots[item_id] or {}) do
-                local pos = cache.pos[spot.range]
+                local pos = cache.fanqie_pos[spot.range]
                 if pos then
                     if (spot.text == nil or spot.text == "") and lines then
                         local pid = tonumber(spot.range:match("(%d+)$"))
@@ -515,13 +514,13 @@ function M.target(ui, link, cache, redraw)
                             spot.text = lines[pid]
                         end
                     end
-                    local span = cache.pages[spot.range]
+                    local span = cache.fanqie_pages[spot.range]
                     if not span then
                         span = {
                             document:getPageFromXPointer(pos[1]),
                             document:getPageFromXPointer(pos[2]),
                         }
-                        cache.pages[spot.range] = span
+                        cache.fanqie_pages[spot.range] = span
                     end
                     if span[1] <= page + 1 and span[2] >= page then
                         local boxes = {}
