@@ -415,6 +415,8 @@ end
 --- 若不存在则向菜单注入桌面面板 Tab。
 ---@param menu table|nil
 local function injectDesktopTab(menu)
+    -- ★ 检查桌面面板开关
+    if require("utils.settings").get("features.panel").show_desktop_tab == false then return end
     local tabs = menu and menu.tab_item_table
     if type(tabs) ~= "table" then return end
     for _idx, tab in ipairs(tabs) do
@@ -426,6 +428,8 @@ end
 --- 若不存在则注入阅读面板 Tab，并同步当前 ReaderUI。
 ---@param menu table|nil
 local function injectReaderTab(menu)
+    -- ★ 检查阅读面板开关
+    if require("utils.settings").get("features.panel").show_reader_tab == false then return end
     if not menu then return end
     local tabs = menu.tab_item_table
     if type(tabs) ~= "table" then return end
@@ -557,9 +561,23 @@ end
 ---@param mode "desktop"|"reader"
 ---@return boolean
 function Native.show(mode)
+    local settings = require("utils.settings").get("features.panel")
+    
+    -- ★ 开关关闭时：不注入 Tab，直接打开 KOReader 原生菜单
+    if mode == "desktop" and settings.show_desktop_tab == false then
+        local ui = require("apps/filemanager/filemanager").instance
+        if ui and ui.menu then ui.menu:onShowMenu() end
+        return true
+    end
+    if mode == "reader" and settings.show_reader_tab == false then
+        local ui = require("apps/reader/readerui").instance
+        if ui and ui.menu then ui.menu:onShowMenu() end
+        return true
+    end
+
+    -- 开关开启：走原逻辑
     local menu = activeMenu()
     if not menu then return false end
-    -- 桌面（FileManager）菜单不注入阅读面板，阅读面板只在阅读菜单里出现。
     if mode == "reader" and not isReaderMenu(menu) then return false end
     if not menu.tab_item_table and menu.setUpdateItemTable then menu:setUpdateItemTable() end
     injectDesktopTab(menu)

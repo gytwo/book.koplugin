@@ -8,7 +8,6 @@ local Store = require("book.store")
 local _ = require("gettext")
 local T = require("ffi/util").template
 
-
 local Common = require("desktop.detail.common")
 local Cache = require("desktop.detail.cache")
 local storeBackend = Common.storeBackend
@@ -18,8 +17,7 @@ local bookSupportsEdit = Common.bookSupportsEdit
 local cacheKey = Cache.key
 
 return function(Detail)
---- 书城详情：已在架可开读的书（书源在架行，或本页刚装进本地书库的书）。
----@return table|nil
+--- 书城详情：已在架可开读的书。
 function Detail:storeReadableBook()
     if self._installed then return self._installed end
     local book = self.book
@@ -33,30 +31,41 @@ function Detail:storeReadableBook()
     return book
 end
 
---- 书城详情主按钮：未入库「加入书库」；已在架 / 刚加入成功则「开始阅读」。
----@return table
+--- 书城详情主按钮：未入库「加入书库」；已在架则「开始阅读」。仅在可导出时附带「导出 EPUB」。
 function Detail:storePrimary()
     local readable = self:storeReadableBook()
+    local tools = {}
+
+    -- 只在当前书籍的属主源支持按章缓存时才加上导出按钮
+    if Cache.supported(readable or self.book, self.source) then
+        tools[#tools + 1] = {
+            id = "export_epub",
+            icon = "book",
+            text = _("导出 EPUB"),
+        }
+    end
+
     if readable then
         local pct = Book.pct(readable)
-        return {
+        local primary = {
             id = "open",
             icon = "play_arrow",
             text = pct > 0 and pct < 100 and _("继续阅读") or _("开始阅读"),
             callback = function() self:openBook() end,
         }
+        return primary, tools
     end
-    return {
+
+    local primary = {
         id = "install",
         icon = "add",
         text = _("加入书库"),
         callback = function() self:installStoreBook() end,
     }
+    return primary, tools
 end
 
---- 续读目标按详情页缓存：updateView 与 openBook 复用，一次打开只算一次。
---- `false` 表示算过、没有目标（继续走原开书流程），避免每帧重试。
----@return BookReadingTarget|nil
+--- 续读目标按详情页缓存
 function Detail:readingTarget()
     if self._reading_target == nil then
         local owner = bookOwnerSource(self.book, self.source)
@@ -82,7 +91,7 @@ function Detail:openBook()
     require("desktop.open").book(plugin, target and target.book or b)
 end
 
---- 「选择卷」：不直接开目标卷，走原来的选卷列表。
+--- 「选择卷」
 function Detail:chooseVolume()
     local plugin = self.plugin
     local b = self.book
@@ -90,22 +99,19 @@ function Detail:chooseVolume()
     if plugin then require("desktop.open").book(plugin, b) end
 end
 
---- 选择缓存范围：全本 / 当前进度到结尾 / 当前进度往后 N 章（当前章取本地进度，无进度即第 1 章）。
---- 源支持段评时多一个开关：同时缓存段评（每句只缓存前 10 条评论，请求频繁有封号风险）。
+--- 选择缓存范围
 function Detail:chooseCacheRange(with_reviews)
     if self.closed then return end
     Cache.chooseRange(self.book, self.source, with_reviews)
 end
 
---- 缓存章节正文（可带段评）：入队并前台显示进度（同一本书已在缓存时拒绝并提示）。
----@param range ChapterCacheRange|nil 缺省全本
----@param with_reviews boolean|nil 正文缓存完后接着缓存段评
+--- 缓存章节正文（可带段评）
 function Detail:cacheAllChapters(range, with_reviews)
     if self.closed then return end
     Cache.cacheAll(self.book, self.source, range, with_reviews)
 end
 
---- 整本书源的未下载书（WebDAV、moon）：入队只落盘不开书，openBookAsync 负责下载并登记路径。
+--- 整本书源的未下载书
 function Detail:downloadBook()
     if self.closed then return end
     if not require("ui/network/manager"):isConnected() then
@@ -134,7 +140,7 @@ function Detail:downloadBook()
     }
 end
 
---- 书城书（Z-Library / OPDS）：进后台下载任务，下载后导入本地书库；详情页关了也继续。
+--- 书城书（Z-Library / OPDS）
 function Detail:installStoreBook()
     local book = self.book
     local store = storeBackend(book)
@@ -182,7 +188,6 @@ function Detail:installStoreBook()
                 desk:onEvent("shelf_changed")
                 if desk.tab == "library" then desk:updateView() end
             end
-            -- 本页还开着：记住刚导入的本地书，主按钮立刻改成「开始阅读」。
             if not self.closed and result.path then
                 self._installed = {
                     source_id = "local",
@@ -196,7 +201,7 @@ function Detail:installStoreBook()
     }
 end
 
---- 书源搜索结果：本地先入库（脏行），在线且源已配置时顺手推上云端书架；离线不弹联网，等下次 pushDirty。
+--- 书源搜索结果：加入书库
 function Detail:addToShelf()
     local book = self.book
     Store.rememberMany({ book })
@@ -214,7 +219,7 @@ function Detail:addToShelf()
     if not self.closed then self:refresh() end
 end
 
---- 手动切换已读 / 未读（语义与图书馆长按菜单相同）。
+--- 切换已读 / 未读
 function Detail:toggleRead()
     local book = self.book
     local is_read = tonumber(book.read_state) == 1
@@ -222,7 +227,6 @@ function Detail:toggleRead()
         Toast:new{ text = _("更新阅读状态失败"), timeout = 2 }:show()
         return
     end
-    -- 标已读会写一条 100% 待上传进度：在线就当场推，不等下一次推脏行。
     local source = bookOwnerSource(book, self.source)
     if source and require("ui/network/manager"):isConnected() then
         source:syncProgressAsync({
@@ -233,7 +237,7 @@ function Detail:toggleRead()
     self:reload()
 end
 
---- 删除本书：先选软删除（清正文、进度划线可恢复）还是彻底删除。
+--- 删除本书：软删除还是彻底删除
 function Detail:deleteBook()
     Sheet:new{
         title = _("删除"),
@@ -244,7 +248,7 @@ function Detail:deleteBook()
     }:show()
 end
 
---- 彻底删除：确认后走属主源 deleteBookAsync，成功则关详情并刷新桌面。
+--- 彻底删除
 function Detail:hardDelete()
     local book = self.book
     Confirm:new{
@@ -266,7 +270,6 @@ function Detail:hardDelete()
                     Toast:new{ text = err or _("删除本书失败") }:show()
                     return
                 end
-                -- 书已删：书架缓存无论详情页是否还开着都要失效。
                 if self.desktop then self.desktop:onEvent("shelf_changed") end
                 if self.closed then return end
                 self._dirty = true
@@ -276,13 +279,6 @@ function Detail:hardDelete()
     }:show()
 end
 
---- 清理本书本地文件：keep_cover 为真保留封面；书籍元数据与进度保留。
---- 本书在后台缓存队列里时拒绝，避免边写边删。
----@param self table
----@param keep_cover boolean
----@param text string 确认文案
----@param ok_text string
----@param done_text string
 local function purgeLocal(self, keep_cover, text, ok_text, done_text)
     local book = self.book
     Confirm:new{
@@ -306,13 +302,10 @@ local function purgeLocal(self, keep_cover, text, ok_text, done_text)
     }:show()
 end
 
---- 清理本书本地缓存：正文、章节、图片、封面需重新下载；书籍元数据与进度保留。
 function Detail:clearCache()
     purgeLocal(self, false, _("清理《%1》的本地缓存？\n正文、章节与图片需重新下载。"), _("清理"), _("缓存已清理"))
 end
 
---- 软删除：清掉本地正文（封面留着），书留在库里（元数据、进度、标注都在），默认不在书架显示，
---- 在书架筛选「软删除」里能找到并恢复。纯本地操作，不动远端。
 function Detail:softDelete()
     local book = self.book
     Confirm:new{
@@ -336,7 +329,6 @@ function Detail:softDelete()
     }:show()
 end
 
---- 恢复软删除的书：重新出现在书架，文档需要时再下载。
 function Detail:restore()
     if not require("book.books_db").setHidden(self.book.source_id, self.book.stable_id, false) then
         Toast:new{ text = _("恢复失败"), timeout = 2 }:show()
@@ -346,12 +338,7 @@ function Detail:restore()
     self:reload()
 end
 
---- 库内书底栏动作：工具行 + 最后一行阅读主按钮。
---- 编辑/刮削/下载/清理缓存按属主源能力出现；已读切换与删除只要身份完整就给。
----@param book table 当前书籍
----@param owner table|nil 属主源
----@param target BookReadingTarget|nil|false 已算好的续读目标（详情页复用）；nil 时现算
----@return table tools, table|nil primary
+--- 库内书底栏动作
 function Detail.actionPlan(book, owner, target)
     local tools = {}
     if bookSupportsEdit(book, owner) then
@@ -361,11 +348,11 @@ function Detail.actionPlan(book, owner, target)
         tools[#tools + 1] = { id = "scrape", icon = "search", text = _("刮削") }
     end
     local can_read = owner ~= nil and (owner.type == "book" or owner.type == "chapter")
-    -- 章节源能缓存就一直给下载（「已下载」只看当前章起连续，缓存一段后后面仍可能要缓存），
-    -- 已离线到 cache 再给清理；整本书源下载与清理互斥；本地原书（path 即文件本身）两者都没有
     local cached = can_read and Store.isCached(book)
     if can_read and owner.type == "chapter" and type(owner.cacheAllChaptersAsync) == "function" then
         tools[#tools + 1] = { id = "download", icon = "download", text = _("下载") }
+        -- 无条件提供导出选项
+        tools[#tools + 1] = { id = "export_epub", icon = "book", text = _("导出 EPUB") }
     elseif can_read and not cached and owner.type == "book" and book.source_id and book.stable_id
         and not require("book.books_db").isDownloaded(book.source_id, book.stable_id, false) then
         tools[#tools + 1] = { id = "download_book", icon = "download", text = _("下载") }
@@ -473,6 +460,188 @@ function Detail:startScrape()
     end, self)
 end
 
+--- 导出为 EPUB：自动补全缺失章节，漏章时弹窗让用户选择。
+function Detail:exportEpub()
+    if self.closed then return end
+    local book = self.book
+    local source = bookOwnerSource(book, self.source)
+    if not source or type(source.cacheAllChaptersAsync) ~= "function" then
+        Toast:new{ text = _("当前数据源不支持导出"), timeout = 2 }:show()
+        return
+    end
 
+    -- 如果目录没缓存过（未入库/未打开过），先拉一次目录
+    local toc = require("source.toc").read(book.source_id, book.stable_id)
+    if not toc or #toc == 0 then
+        if type(source.loadTocAsync) ~= "function" then
+            Toast:new{ text = _("目录为空，请先打开一次本书"), timeout = 2 }:show()
+            return
+        end
+        local ProgressDialog = require("ui/themes/widgets/progress_dialog")
+        local dlg = ProgressDialog:new{
+            title = _("导出 EPUB"),
+            text = _("正在获取目录..."),
+            dismissable = false,
+        }
+        dlg:show()
+        local identity = { source_id = book.source_id, stable_id = book.stable_id, book = book, source = source }
+        source:loadTocAsync(identity, function(t, err)
+            dlg:close()
+            if not t or #t == 0 then
+                Toast:new{ text = err or _("目录为空，无法导出"), timeout = 3 }:show()
+                return
+            end
+            self:_do_export(book, source, t)
+        end)
+        return
+    end
+    self:_do_export(book, source, toc)
+end
+
+function Detail:_do_export(book, source, toc)
+    local home_dir = G_reader_settings:readSetting("home_dir") or "/mnt/onboard"
+    local safe_title = (book.title or book.stable_id):gsub("[/\\:%*%?\"<>|]", "_")
+    local output_path = home_dir .. "/" .. safe_title .. ".epub"
+
+    Confirm:new{
+        text = T(_("导出前会自动检查并补全缺失的章节（已下载的会跳过）。\n\n导出位置：%1\n\n是否继续？"), output_path),
+        ok_text = _("开始导出"),
+        ok_callback = function()
+            os.execute("mkdir -p " .. string.format("%q", home_dir))
+
+            require("workers.ui.task_dialog").start{
+                key = "export\0" .. book.source_id .. "\0" .. book.stable_id,
+                kind = "cache",
+                title = book.title or book.stable_id,
+                restartable = true,
+                run = function(report, done)
+                    local identity = { source_id = book.source_id, stable_id = book.stable_id, book = book, source = source }
+
+                    report(_("检查缺失章节..."), 0, #toc)
+                    local cache_job = source:cacheAllChaptersAsync(identity, function(cached, total)
+                        report(_("补全章节"), cached, total)
+                    end, function(ok, cached, err, total, failed, failed_idx)
+                        if failed > 0 then
+                            local shown = {}
+                            for i = 1, math.min(#(failed_idx or {}), 10) do shown[#shown + 1] = failed_idx[i] end
+                            local failed_str = table.concat(shown, "、")
+                                .. (#(failed_idx or {}) > 10 and "…" or "")
+                            local text = T(
+                                _("有 %1 章下载失败（章号：%2）。\n\n是重试补全，还是跳过并导出当前已有章节？"),
+                                failed, failed_str
+                            )
+                            Confirm:new{
+                                text = text,
+                                ok_text = _("重试"),
+                                ok_callback = function()
+                                    local retry_job = source:cacheAllChaptersAsync(identity, function(c, t)
+                                        report(_("重新补全章节"), c, t)
+                                    end, function(_, _, _, _, _, _)
+                                        report(_("准备打包..."), 0, 1)
+                                        self:runEpubWorker(book, toc, output_path, report, done)
+                                    end)
+                                    if cache_job and cache_job.cancel then cache_job.cancel = retry_job.cancel end
+                                end,
+                                cancel_text = _("跳过并导出"),
+                                cancel_callback = function()
+                                    report(_("准备打包..."), 0, 1)
+                                    self:runEpubWorker(book, toc, output_path, report, done)
+                                end,
+                            }:show()
+                        else
+                            report(_("准备打包..."), 0, 1)
+                            self:runEpubWorker(book, toc, output_path, report, done)
+                        end
+                    end)
+                    return {
+                        cancel = function()
+                            if cache_job and cache_job.cancel then cache_job.cancel() end
+                        end,
+                    }
+                end,
+                on_done = function(result)
+                    if result.ok then
+                        -- 加入对应书源的书单
+                        pcall(function()
+                            local ReadCollection = require("readcollection")
+                            local COLLECTION_NAME = book.source_id or "导出"
+                            if not ReadCollection.coll then ReadCollection:_read() end
+                            if not ReadCollection.coll[COLLECTION_NAME] then
+                                ReadCollection:addCollection(COLLECTION_NAME)
+                            end
+                            if not ReadCollection:isFileInCollection(result.path, COLLECTION_NAME) then
+                                ReadCollection:addItem(result.path, COLLECTION_NAME)
+                                ReadCollection:write({ [COLLECTION_NAME] = true })
+                            end
+                        end)
+                        Confirm:new{
+                            text = T(_("导出成功：\n%1\n\n是否立即打开阅读？"), result.path),
+                            ok_text = _("立即阅读"),
+                            ok_callback = function()
+                                require("desktop.open").book(self.plugin, {
+                                    source_id = "local",
+                                    stable_id = result.path,
+                                    path = result.path,
+                                    title = book.title,
+                                })
+                            end,
+                            cancel_text = _("关闭"),
+                        }:show()
+                    else
+                        Toast:new{ text = _("导出失败: ") .. (result.error or "未知错误"), timeout = 4 }:show()
+                    end
+                end,
+            }
+        end,
+    }:show()
+end
+
+function Detail:runEpubWorker(book, toc, output_path, report, done)
+    local Paths = require("utils.paths")
+    local Job = require("workers.job")
+
+    local book_dir = Paths.bookWorkDir(book.stable_id, book.source_id)
+
+    local BookDB = require("book.books_db")
+    local full_row = BookDB.get(book.source_id, book.stable_id)
+    local meta = (full_row and full_row.meta) or book.meta or {}
+
+    local task = {
+        book = {
+            stable_id = book.stable_id,
+            source_id = book.source_id,
+            title = book.title or (full_row and full_row.title),
+            authors = book.authors or (full_row and full_row.authors),
+            intro = book.intro or (full_row and full_row.intro),
+            category = book.category or (full_row and full_row.category),
+            series = book.series or (full_row and full_row.series),
+            tags = meta.tags,
+            language = meta.language or "zh",
+            publisher = meta.publisher,
+            published = meta.published,
+            isbn = meta.isbn,
+        },
+        toc = toc,
+        output_path = output_path,
+        book_dir = book_dir,
+        container_xml = [[<?xml version="1.0" encoding="utf-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>]],
+        css = "body{line-height:1.7;margin:5%;}p{text-indent:2em;margin:.45em 0;}img{max-width:100%;}",
+    }
+
+    Job.run(function()
+        return require("book.epub_worker").run(task)
+    end, {
+        name = "export_epub",
+        kind = "light",
+        timeout = 300,
+        on_done = done,
+        on_failed = function(err)
+            done({ ok = false, error = tostring(err) })
+        end,
+    })
+end
 
 end

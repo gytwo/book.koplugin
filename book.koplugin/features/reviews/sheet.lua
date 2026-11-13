@@ -41,6 +41,8 @@ local Text = require("ui.themes.widgets.text")
 local TitleBar = require("ui.themes.widgets.titlebar")
 local T = require("ffi/util").template
 local _ = require("gettext")
+local GestureRange = require("ui/gesturerange")
+local Input = require("ui/input")
 
 local QUOTE_LINES = 6
 local MAX_THUMBS = 3
@@ -96,6 +98,9 @@ local Sheet = Modal:extend{
 
 function Sheet:init()
     Modal.init(self)
+    self.ges_events.SwipeUpClose = {
+        GestureRange:new{ ges = "swipe", range = self.dimen },
+    }
     local t = self.theme
     self.pad = Theme.px(t.space.lg)
     self.inner_w = self.dimen.w - self.pad * 2
@@ -111,6 +116,15 @@ function Sheet:init()
     self:paginate()
     self:rebuild()
     self:load()
+end
+
+function Sheet:onSwipeUpClose(_arg, ges)
+    if not Input.isTop(self) then return false end
+    if ges.direction == "north" then
+        self:dismiss()
+        return true
+    end
+    return false
 end
 
 --- 横线分隔（引用竖条也用它）。

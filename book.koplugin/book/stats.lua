@@ -252,4 +252,48 @@ function Stats.syncAsync(source, opts, cb)
         end }
 end
 
+--- 把本地书的待上传统计伪装成微信书，推给微信源。
+---@param local_source_id string
+---@param wechat_source BookSource
+---@param wechat_book_id string
+---@param done fun(ok: boolean, result: any, confirmed: integer|nil)|nil
+---@return table|nil job
+function Stats.pushLocalAsWechat(local_source_id, wechat_source, wechat_book_id, done)
+    if type(wechat_source.pushStatsAsync) ~= "function" then
+        if done then done(false, "unsupported") end
+        return
+    end
+
+    local rows = StatsDB.unsyncedBySource(local_source_id, PUSH_BATCH)
+    if #rows == 0 then
+        if done then done(true, "empty") end
+        return
+    end
+
+    local masked, ids = {}, {}
+    for _idx, row in ipairs(rows) do
+        local copy = {}
+        for k, v in pairs(row) do copy[k] = v end
+        copy.source_id = wechat_source.id
+        copy.stable_id = wechat_book_id
+        masked[#masked + 1] = copy
+        ids[#ids + 1] = row.id
+    end
+
+    local job = wechat_source:pushStatsAsync(masked, function(result, err)
+        if result and not err then
+            local confirm_ids = type(result) == "table" and result.synced_ids or ids
+            if confirm_ids and #confirm_ids > 0 then
+                StatsDB.markSynced(confirm_ids)
+            end
+            if done then done(true, result, #confirm_ids) end
+        else
+            if done then done(false, err) end
+        end
+    end)
+    return { cancel = function()
+        if job and job.cancel then job:cancel() end
+    end }
+end
+
 return Stats

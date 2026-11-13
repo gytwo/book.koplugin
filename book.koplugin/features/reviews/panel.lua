@@ -1,84 +1,111 @@
 --[[--
-段评的阅读快捷面板：显示开关，以及给本地书关联微信读书书目。
-
-显示开关写当前页实际用的那份 `show_paragraph_reviews`：本章属主源自己有段评就写它，
-否则写微信读书（本地书、京东读书借段评）。和书源设置页是同一处，不另存一份。
-
+段评的阅读快捷面板：绑定、开关与拉取。
 @module koplugin.book.features.reviews.panel
 --]]
 
 require("l10n").apply()
-
 local _ = require("gettext")
 
 local Panel = {}
-
---- 当前阅读页段评画线由哪个源的开关控制。
---- 第二个返回值：true = 本章属主源自己的段评，false = 借微信读书。
----@return string|nil
----@return boolean
-local function sourceId()
-    local cur = require("reader.session").current()
-    local identity = cur and cur.identity
-    if not identity or identity.ephemeral then return nil, false end
-    local source = identity.source --[[@as ParagraphReviewSource|nil]]
-    if source and (source.chapterReviewHotspotsAsync or (identity.chapter_idx and source.paragraphHotspotsAsync)) then
-        return source.id, true
-    end
-    local wechat = require("source.registry").resolve("wechat")
-    if wechat and wechat:configured() then return wechat.id, false end
-    return nil, false
-end
 
 ---@return BookQuickPanelAction[]
 function Panel.actions()
     return {
         {
-            id = "reviews_show",
-            title = _("显示段评"),
-            icon = "forum",
+            id = "review_bind",
+            title = _("关联书源"),
+            icon = "link",
             scope = "reader",
-            keep_open = true,
-            ---@param ctx BookQuickPanelContext|nil
-            ---@return boolean
             available = function(ctx)
                 local ui = ctx and ctx.ui
                 if not ui then return true end
-                local id, own = sourceId()
-                if not id then return false end
-                if own then return true end
-                return require("features.reviews.link").available(ui)
+                local cur = require("reader.session").current()
+                if cur and cur.identity and cur.identity.ephemeral then
+                    return false
+                end
+                return true
             end,
-            active = function()
-                local id = sourceId()
-                return id ~= nil and require("source.review_setting").enabled(id)
-            end,
-            ---@param ctx BookQuickPanelContext
             run = function(ctx)
-                local id = sourceId()
-                if not id then return end
-                local ReviewSetting = require("source.review_setting")
-                ReviewSetting.set(id, not ReviewSetting.enabled(id))
+                require("features.reviews.link").Bind.open(ctx.ui)
+            end,
+        },
+        {
+            id = "reviews_link_switch",
+            title = _("拉取微信评论"), 
+            icon = "forum",
+            scope = "reader",
+            available = function(ctx)
+                local ui = ctx and ctx.ui
+                return not ui or require("features.reviews.linked").supported(ui.document)
+            end,
+            keep_open = true,
+            active = function(ctx)
+                local ui = ctx and ctx.ui
+                return ui ~= nil and require("features.reviews.linked").enabled(ui)
+            end,
+            run = function(ctx)
+                require("features.reviews.link").openPull(ctx.ui)
+            end,
+        },
+        {
+            id = "fanqie_reviews_switch",
+            title = _("拉取番茄段评"),
+            icon = "forum",
+            scope = "reader",
+            keep_open = true,
+            available = function(ctx)
+                local ui = ctx and ctx.ui
+                if not ui then return true end
+                local book = require("features.reviews.linked").get(ui)
+                return book ~= nil and book.fanqie ~= nil
+            end,
+            active = function(ctx)
+                local ui = ctx and ctx.ui
+                if not ui or not ui.doc_settings then return false end
+                return ui.doc_settings:readSetting("fanqie_reviews_enabled") ~= false
+            end,
+            run = function(ctx)
+                local ui = ctx.ui
+                if not ui or not ui.doc_settings then return end
+                local on = ui.doc_settings:readSetting("fanqie_reviews_enabled") ~= false
+                ui.doc_settings:saveSetting("fanqie_reviews_enabled", not on)
+                require("ui/uimanager"):setDirty(ui.dialog, "ui")
+            end,
+        },
+        {
+            id = "reviews_show",
+            title = _("显示段评"), 
+            icon = "forum",
+            scope = "reader",
+            keep_open = true,
+            available = function(ctx)
+                local ui = ctx and ctx.ui
+                if not ui then return true end
+                local cur = require("reader.session").current()
+                local identity = cur and cur.identity
+                if not identity or identity.ephemeral then return false end
+                local source = identity.source
+                if not source then return false end
+                -- 只有支持段评能力的源才显示这个开关（如微信、番茄）
+                return source.chapterReviewHotspotsAsync ~= nil or source.paragraphHotspotsAsync ~= nil
+            end,
+            active = function(ctx)
+                local cur = require("reader.session").current()
+                local identity = cur and cur.identity
+                if not identity or not identity.source then return false end
+                return identity.source:paragraphReviewsEnabled()
+            end,
+            run = function(ctx)
+                local cur = require("reader.session").current()
+                local identity = cur and cur.identity
+                if not identity or not identity.source then return end
+                local source = identity.source
+                local enabled = source:paragraphReviewsEnabled()
+                require("source.review_setting").set(source.id, not enabled)
                 local ui = ctx.ui
                 if ui and ui.dialog then
                     require("ui/uimanager"):setDirty(ui.dialog, "ui")
                 end
-            end,
-        },
-        {
-            id = "wechat_reviews_link",
-            title = _("关联微信段评"),
-            icon = "forum",
-            scope = "reader",
-            ---@param ctx BookQuickPanelContext|nil
-            ---@return boolean
-            available = function(ctx)
-                local ui = ctx and ctx.ui
-                return not ui or require("features.reviews.link").available(ui)
-            end,
-            ---@param ctx BookQuickPanelContext
-            run = function(ctx)
-                require("features.reviews.link").open(ctx.ui)
             end,
         },
     }

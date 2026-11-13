@@ -318,6 +318,12 @@ local function currentTarget(self)
         if not (wechat and wechat:configured() and wechat:paragraphReviewsEnabled()) then return nil end
         return chapterTarget(self, identity, wechat)
     end
+    -- 👇👇👇 就是改这里 👇👇👇
+    -- 本地书：先看段评开关（旧键）是否打开，没打开就直接返回 nil，不渲染
+    if not Linked.enabled(self.ui) then
+        return nil
+    end
+    -- 开关打开了，再去读新键的绑定书号，拉取并渲染
     return Linked.target(self.ui, self.cache, function() redraw(self) end)
 end
 
@@ -368,10 +374,15 @@ function ReviewMarks:updateView()
     local marks = {}
     for _idx, placement in ipairs(target.place(self.data)) do
         local entry = placement.entry
+        local badge = entry.spot.badge
+        if not badge and entry.identity and entry.identity.source_id == "fanqie" then
+            local n = tonumber(entry.spot.total) or 0
+            badge = n > 99 and "99+" or tostring(n)
+        end
         marks[#marks + 1] = {
             spot = entry.spot,
             boxes = placement.boxes,
-            badge = entry.spot.badge,
+            badge = badge,
             heading = entry.spot.heading,
             tap = function() require("features.reviews.sheet").open(entry.identity, entry.spot) end,
         }
