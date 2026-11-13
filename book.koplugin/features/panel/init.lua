@@ -23,8 +23,9 @@ local DISPATCHER_ACTIONS = {
     { id = "xray",                title = _("月读：X-Ray"),         reader = true },
     { id = "settings",            title = _("月读：阅读设置"),      reader = true },
     { id = "reviews_show",        title = _("月读：显示段评"),      reader = true },
-    { id = "wechat_bind",         title = _("月读：关联微信读书"),  reader = true },
+    { id = "review_bind",         title = _("月读：关联书源"),      reader = true },
     { id = "reviews_link_switch", title = _("月读：拉取微信评论"),  reader = true },
+    { id = "fanqie_reviews_switch", title = _("月读：拉取番茄段评"), reader = true },
 }
 
 --- 注册所有月读快捷面板动作为系统动作。
