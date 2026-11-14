@@ -516,20 +516,32 @@ function Catalog.listBooks(source_id, opts)
         where = where .. " AND b.source_id=?"
         args[#args + 1] = opts.source_id
     end
+    local use_terms = source_id == "local"
+    local TermsDB = require("book.terms_db")
     if opts.uncategorized then
-        where = where .. " AND (b.category IS NULL OR b.category='')"
+        where = where .. (use_terms and (" AND " .. TermsDB.notExistsClause("category", "b"))
+            or " AND (b.category IS NULL OR b.category='')")
     elseif opts.category and opts.category ~= "" then
-        where = where .. " AND b.category=?"
-        args[#args + 1] = opts.category
+        if use_terms then
+            where = where .. " AND " .. TermsDB.existsClause("category", opts.category, "b", args)
+        else
+            where = where .. " AND b.category=?"
+            args[#args + 1] = opts.category
+        end
     end
     if opts.unseries then
-        where = where .. " AND (b.series IS NULL OR b.series='')"
+        where = where .. (use_terms and (" AND " .. TermsDB.notExistsClause("series", "b"))
+            or " AND (b.series IS NULL OR b.series='')")
     elseif opts.series and opts.series ~= "" then
-        where = where .. " AND b.series=?"
-        args[#args + 1] = opts.series
+        if use_terms then
+            where = where .. " AND " .. TermsDB.existsClause("series", opts.series, "b", args)
+        else
+            where = where .. " AND b.series=?"
+            args[#args + 1] = opts.series
+        end
     end
+
     if type(opts.dir) == "string" and opts.dir ~= "" then
-        -- 只取该目录下直接放的书；substr 按字符计，前缀长度也要按字符数。
         local prefix = opts.dir .. "/"
         local chars = select(2, prefix:gsub("[^\128-\191]", ""))
         local expr, root_args = Catalog.folderPathExpr("b", opts.root)
@@ -544,11 +556,17 @@ function Catalog.listBooks(source_id, opts)
             end
         end
     end
+
     if opts.unauthor then
-        where = where .. " AND (b.authors IS NULL OR b.authors='')"
+        where = where .. (use_terms and (" AND " .. TermsDB.notExistsClause("author", "b"))
+            or " AND (b.authors IS NULL OR b.authors='')")
     elseif opts.author and opts.author ~= "" then
-        where = where .. " AND b.authors=?"
-        args[#args + 1] = opts.author
+        if use_terms then
+            where = where .. " AND " .. TermsDB.existsClause("author", opts.author, "b", args)
+        else
+            where = where .. " AND b.authors=?"
+            args[#args + 1] = opts.author
+        end
     end
     if opts.search and opts.search ~= "" then
         where = where .. [[ AND (b.title LIKE ? ESCAPE '\' OR b.authors LIKE ? ESCAPE '\' OR b.stable_id LIKE ? ESCAPE '\')]]
