@@ -20,6 +20,7 @@ local MENU_W = 160
 local ACTIONS = {
     edit = "openEditor",
     scrape = "startScrape",
+    refresh_meta = "refreshMeta",
     download = "chooseCacheRange",
     download_book = "downloadBook",
     export_epub = "exportEpub",
