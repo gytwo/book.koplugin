@@ -310,6 +310,7 @@ function Session.onReaderReady(plugin)
         })
     end
     span:finish(Session.SLOW_READY_MS, identity.source_id, chapter_mode and "chapter" or "book")
+    require("reader.page_diag").install()
 end
 
 --- 推送当前进度和注解。span 可选：关书 / 休眠把同步段拆进同一条 warn。
@@ -380,6 +381,7 @@ end
 --- CloseDocument：结清阅读状态；切章保留目录，真正关书清除全部章节状态。
 ---@param plugin table Book 插件实例
 function Session.onCloseDocument(plugin)
+    require("reader.page_diag").uninstall()
     local span = require("utils.perf").begin("reader.close")
     if Session._snapshot and plugin.ui then
         require("reader.prefs").captureAndSave(plugin.ui, Session._snapshot.identity)
@@ -421,7 +423,9 @@ function Session.onPageUpdate(plugin, page)
             position = session.position,
         })
     end
+    ChapterMode.refreshTocIfNeeded(session)
     Perf.slow("page.update", started_at)
+    require("reader.page_diag").notePageUpdate(started_at, session.page)
 end
 
 --- PosUpdate（滚动视图）：同 PageUpdate。
@@ -482,6 +486,14 @@ function Session.onResume(plugin)
             position = require("reader.session.progress").position(session),
         })
     end
+    ChapterMode.refreshTocIfNeeded(session)
+end
+
+--- 联网后补试当前章节书的目录；离线开书不会消耗联网节流。
+---@param plugin table
+function Session.onNetworkConnected(plugin)
+    if not plugin.ui.document then return end
+    ChapterMode.refreshTocIfNeeded(Session._snapshot)
 end
 
 --- 从目录或其他阅读 UI 切换到指定章节；只有连续章节会话能切，整书返回 false。
