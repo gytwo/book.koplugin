@@ -237,6 +237,25 @@ function Detail:toggleRead()
     self:reload()
 end
 
+--- 单本重读内嵌元数据（有 sidecar 读 sidecar，没有开引擎）。
+function Detail:refreshMeta()
+    local book = self.book
+    local owner = bookOwnerSource(book, self.source)
+    if not owner or type(owner.refreshBookMetaAsync) ~= "function" then
+        Toast:new{ text = _("当前数据源不支持") }:show()
+        return
+    end
+    Toast:new{ text = _("正在读取内嵌元数据…"), timeout = 1 }:show()
+    owner:refreshBookMetaAsync(book.stable_id, function(ok, err)
+        if not ok then
+            Toast:new{ text = err or _("读取失败") }:show()
+            return
+        end
+        Toast:new{ text = _("元数据已刷新"), timeout = 1.5 }:show()
+        self:reload()
+    end)
+end
+
 --- 删除本书：软删除还是彻底删除
 function Detail:deleteBook()
     Sheet:new{
@@ -362,6 +381,11 @@ function Detail.actionPlan(book, owner, target)
     end
     if owner and type(owner.bookReviewsAsync) == "function" then
         tools[#tools + 1] = { id = "reviews", icon = "forum", text = _("书评") }
+    end
+    -- 本地目录书：单本重读内嵌元数据
+    if owner and owner.type == "book" and book.source_id == "local" and book.stable_id
+        and not require("source.local.client").isRemote(book.stable_id) then
+        tools[#tools + 1] = { id = "refresh_meta", icon = "refresh", text = _("刷新元数据") }
     end
     if book.source_id and book.stable_id then
         if tonumber(book.read_state) == 1 then
