@@ -159,6 +159,20 @@ function TermsDB.countsBy(column, source_id)
     for i = 1, nrows do
         rows[i] = { [column] = result[1][i], count = tonumber(result[2][i]) or 0 }
     end
+    -- 补空桶：没有任何该 kind 行的在架书（无标签 / 无系列 / 无作者）
+    local empty_args = {}
+    local empty_where = DB.sourceClause("b.source_id", source_id, empty_args)
+    empty_args[#empty_args + 1] = kind
+    local empty = tonumber(DB.rowexec(
+        "SELECT COUNT(*) FROM books b WHERE " .. empty_where
+            .. " AND b.deleted=0 AND b.hidden=0"
+            .. " AND NOT EXISTS (SELECT 1 FROM book_terms t"
+            .. " WHERE t.source_id=b.source_id AND t.stable_id=b.stable_id AND t.kind=?);",
+        unpack(empty_args)
+    )) or 0
+    if empty > 0 then
+        rows[#rows + 1] = { [column] = "", count = empty }
+    end
     return rows
 end
 
