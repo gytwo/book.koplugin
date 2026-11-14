@@ -203,6 +203,15 @@ local function commitFiles(files, known, full_snapshot, kept, root)
         if not cached or f.changed then
             known[f.path] = BookDB.get(SOURCE_ID, stable_id) or known[f.path]
         end
+        if f.category or f.series then
+            local TermsDB = require("book.terms_db")
+            if f.category then
+                TermsDB.setTerms(SOURCE_ID, f.path, "category", { f.category }, "folder")
+            end
+            if f.series then
+                TermsDB.setTerms(SOURCE_ID, f.path, "series", { f.series }, "folder")
+            end
+        end
     end
     if not full_snapshot then return true end
     -- 换目录后还没搬进来的书先留下 path 等下次按 md5 收编，不要被 reconcile 清掉。
@@ -239,13 +248,62 @@ local function markCoverTried(index, path, fp, md5)
     }, true)
 end
 
+--- 单本重读内嵌元数据：有 sidecar 读 sidecar，没有开引擎读一次，写回 books。
+--- 只处理纯本地书（stable_id 即文件路径）；WebDAV 书不在此路径。
+---@param self LocalClient
+---@param path string 书文件绝对路径（stable_id）
+---@param cb fun(ok: boolean, err: string|nil)
+---@return { cancel: fun() }|nil
+function Scan.refreshBookMetaAsync(self, path, cb)
+    local BookDB = require("book.books_db")
+    local row = BookDB.get(SOURCE_ID, path)
+    if not row or row.deleted ~= 0 then
+        return defer(cb, false, _("书籍不在书架"))
+    end
+    if lfs.attributes(path, "mode") ~= "file" then
+        return defer(cb, false, _("书籍文件不存在"))
+    end
+    local job = Job.run(function()
+        return parseBookProps(path, path)
+    end, {
+        name = "local.refresh_meta",
+        kind = "light",
+        on_done = function(props)
+            if not props then
+                cb(false, _("无法读取内嵌元数据"))
+                return
+            end
+            local ok = BookDB.upsertLocal({
+                source_id = SOURCE_ID, stable_id = path,
+                title = props.title or row.title,
+                authors = props.authors or row.authors,
+                intro = props.intro or row.intro,
+                category = row.category, series = row.series,
+                meta = { language = props.language or (row.meta and row.meta.language) },
+            })
+            if ok then
+                local TermsDB = require("book.terms_db")
+                TermsDB.setTermsFromString(SOURCE_ID, path, "author", props.authors, "embedded")
+                TermsDB.setTermsFromString(SOURCE_ID, path, "series", props.series, "embedded")
+                TermsDB.setTermsFromString(SOURCE_ID, path, "category", props.keywords, "embedded")
+            end
+            cb(ok == true, ok and nil or _("保存元数据失败"))
+        end,
+        on_failed = function(err)
+            require("utils.log").warn("book local refresh meta failed", path, err)
+            cb(false, tostring(err))
+        end,
+    })
+    return { cancel = function() job:cancel() end }
+end
+
 --- 补齐：缺封面且未试过的在架本地书，子进程开引擎提封面并升级元数据；已有封面只记 tried。
 --- 可取消；崩溃记 skip 并落 tried，避免每轮同书再崩；没做完的下次 ensureEnrich 接着啃。
 ---@param self LocalClient
 ---@param cb fun()|nil
 ---@param report fun(text: string, done: integer|nil, total: integer|nil)|nil
 ---@return { cancel: fun() }
-function Scan.enrichAsync(self, cb, report)
+function Scan.enrichAsync(self, cb, report, force)
     report = report or function() end
     cb = cb or function() end
     local index = ScanDB.all()
@@ -255,7 +313,7 @@ function Scan.enrichAsync(self, cb, report)
     for path, row in pairs(rows) do
         if row.deleted == 0 and type(row.path) == "string" and remoteRelativePath(path) == nil then
             local seen = index[path]
-            if not (seen and seen.cover) then
+            if force or not (seen and seen.cover) then
                 pending[#pending + 1] = {
                     path = path,
                     fp = seen and seen.fp,
@@ -277,7 +335,7 @@ function Scan.enrichAsync(self, cb, report)
         local opening
         local todo = {}
         for _idx, item in ipairs(pending) do
-            if item.has_cover then
+            if item.has_cover and not force then
                 markCoverTried(index, item.path, item.fp, item.md5)
             elseif not skip[item.path] then
                 todo[#todo + 1] = item
@@ -298,6 +356,8 @@ function Scan.enrichAsync(self, cb, report)
                     path = item.path, fp = item.fp, md5 = item.md5,
                     title = props.title, authors = props.authors,
                     intro = props.intro, language = props.language,
+                    series = props.series, series_index = props.series_index,
+                    keywords = props.keywords,
                 }
             end
             return { books = out }
@@ -312,13 +372,14 @@ function Scan.enrichAsync(self, cb, report)
                 opening = value or nil
             end,
             on_done = function(result)
+                local TermsDB = require("book.terms_db")
                 for _idx, f in ipairs(result.books or {}) do
                     markCoverTried(index, f.path, f.fp, f.md5)
-                    local row = f.title and f.title ~= "" and BookDB.get(SOURCE_ID, f.path)
+                    local row = BookDB.get(SOURCE_ID, f.path)
                     local name = f.path:match("([^/]+)$") or f.path
-                    -- 只升级仍是文件名兜底的行，用户改过的书名 / 已有元数据不覆盖
                     local fallback = parseFilename(name)
-                    if row and (not row.title or row.title == "" or row.title == fallback) then
+                    if row and f.title and f.title ~= ""
+                        and (not row.title or row.title == "" or row.title == fallback) then
                         BookDB.upsertLocal({
                             source_id = SOURCE_ID, stable_id = f.path,
                             title = f.title, authors = f.authors, intro = f.intro,
@@ -326,6 +387,10 @@ function Scan.enrichAsync(self, cb, report)
                             meta = { language = f.language },
                         })
                     end
+                    -- 多值维度始终按本次内嵌结果覆盖 embedded 层
+                    TermsDB.setTermsFromString(SOURCE_ID, f.path, "author", f.authors, "embedded")
+                    TermsDB.setTermsFromString(SOURCE_ID, f.path, "series", f.series, "embedded")
+                    TermsDB.setTermsFromString(SOURCE_ID, f.path, "category", f.keywords, "embedded")
                 end
                 cb()
             end,
@@ -362,12 +427,12 @@ end
 ---@param self LocalClient
 ---@param report fun(text: string, done: integer|nil, total: integer|nil)|nil
 ---@return { cancel: fun() }|nil
-function Scan.ensureEnrich(self, report)
+function Scan.ensureEnrich(self, report, force)
     if self._enrich_job then return self._enrich_job end
     local handle
     handle = Scan.enrichAsync(self, function()
         if self._enrich_job == handle then self._enrich_job = nil end
-    end, report)
+    end, report, force)
     self._enrich_job = handle
     return handle
 end
@@ -379,7 +444,7 @@ end
 ---@param cb fun(ok: boolean, err: string|nil)
 ---@param report fun(text: string, done: integer|nil, total: integer|nil)|nil 真实步骤上报
 ---@return { cancel: fun() }
-function Scan.scanAsync(self, cb, report)
+function Scan.scanAsync(self, cb, report, force)
     local valid, path_err = self:validatePath()
     if not valid then return defer(cb, false, path_err) end
     report = report or function() end
@@ -449,7 +514,7 @@ function Scan.scanAsync(self, cb, report)
                     require("utils.log").dbg("book.perf local.scan", Perf.elapsedMs(started_at), "ms",
                         "files", #files, unchanged and "unchanged" or "committed")
                     cb(true)
-                    Scan.ensureEnrich(self, report)
+                    Scan.ensureEnrich(self, report, force)
                 else
                     require("utils.log").warn("book local scan commit failed at", step, "files", #files)
                     cb(false, "failed to commit local scan: " .. tostring(step))
@@ -460,11 +525,11 @@ function Scan.scanAsync(self, cb, report)
                 -- 轻扫不再开文档，子进程崩多半是列目录 / md5；整轮失败，已批落盘的索引与书目保留续扫
                 require("utils.log").warn("book local scan failed", err)
                 cb(false, err or "local scan failed")
-                Scan.ensureEnrich(self, report)
+                Scan.ensureEnrich(self, report, force)
             end,
             on_cancelled = function()
                 -- 已批入库的留下；补齐接着啃已在架缺封面的
-                Scan.ensureEnrich(self)
+                Scan.ensureEnrich(self, report, force)
             end,
         })
     end
@@ -572,15 +637,15 @@ function Scan.moveBook(self, stable_id, category, series)
     if bad_cat or bad_ser then
         return nil, _("目录名不能含斜杠或以点开头")
     end
-    if not cat then
-        ser = nil
+    if not ser then
+        cat = nil
     end
     local dir = root
-    if cat then
-        dir = dir .. "/" .. cat
-    end
     if ser then
         dir = dir .. "/" .. ser
+    end
+    if cat then
+        dir = dir .. "/" .. cat
     end
     local new_path = dir .. "/" .. filename
     if new_path == stable_id then
@@ -590,10 +655,10 @@ function Scan.moveBook(self, stable_id, category, series)
         return nil, _("目标位置已有同名文件：") .. filename
     end
     -- lfs.mkdir 不递归，逐级建；目录已存在会失败，忽略（os.rename 会做最终裁决）
-    if cat then
-        lfs.mkdir(root .. "/" .. cat)
-    end
     if ser then
+        lfs.mkdir(root .. "/" .. ser)
+    end
+    if cat then
         lfs.mkdir(dir)
     end
     local moved, move_err = os.rename(stable_id, new_path)
@@ -635,6 +700,12 @@ function Scan.indexOneAsync(self, path, cb)
     local function commit(f)
         if commitFiles({ f }, known) then
             ScanDB.save(index, { f }, true)
+            if f.meta_read then
+                local TermsDB = require("book.terms_db")
+                TermsDB.setTermsFromString(SOURCE_ID, path, "author", f.authors, "embedded")
+                TermsDB.setTermsFromString(SOURCE_ID, path, "series", f.series, "embedded")
+                TermsDB.setTermsFromString(SOURCE_ID, path, "category", f.keywords, "embedded")
+            end
             cb(true, nil, path)
         else
             cb(nil, "failed to commit local book")
@@ -643,13 +714,17 @@ function Scan.indexOneAsync(self, path, cb)
     local job = Job.run(function(progress)
         local f = parseFile({ name = name, path = path, fp = fp }, known, digests, index)
         progress(path)
-        local props = parseBookProps(path, cover_key) or {}
+        local props = parseBookProps(path, cover_key)
         progress(false)
         f.cover_tried = true
-        if props.title and props.title ~= "" then
+        if props and props.title and props.title ~= "" then
             f.title, f.authors, f.intro, f.language = props.title, props.authors, props.intro, props.language
         elseif not f.title or f.title == "" then
             f.title, f.authors = parseFilename(name)
+        end
+        if props then
+            f.series, f.series_index, f.keywords = props.series, props.series_index, props.keywords
+            f.meta_read = true
         end
         return f
     end, {
@@ -664,7 +739,6 @@ function Scan.indexOneAsync(self, path, cb)
                 require("utils.log").warn("book local index failed", err)
                 return cb(nil, err)
             end
-            -- 开文档时子进程被杀（引擎崩溃 / 内存不足）：书照常入库，书名取文件名，不再开文档
             require("utils.log").warn("book local index crashed; import by filename", path, err)
             local f = parseFile({ name = name, path = path, fp = fp }, known, digests, index)
             f.cover_tried = true
