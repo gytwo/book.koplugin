@@ -17,16 +17,14 @@ function Detail:openEditor()
         return
     end
     local TermsDB = require("book.terms_db")
-    local function embedded_text(kind, fallback)
-        local list = TermsDB.getTermsByOrigin(book.source_id, book.stable_id, kind, "embedded")
-        if #list > 0 then return table.concat(list, "；") end
-        return fallback or ""
+    local function current_text(kind, fallback)
+        return TermsDB.getTermsText(book.source_id, book.stable_id, kind) or fallback or ""
     end
     local initial = {
         title = book.title or "",
-        author = embedded_text("author", Book.author(book)),
-        category = embedded_text("category", book.category),
-        series = embedded_text("series", book.series),
+        author = current_text("author", Book.author(book)),
+        category = current_text("category", book.category),
+        series = current_text("series", book.series),
     }
     self._edit_initial = initial
     Input:new{
