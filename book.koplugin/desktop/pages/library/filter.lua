@@ -136,4 +136,96 @@ function Filter.openStatus(anchor, data, filter, on_pick)
     return show(anchor, items)
 end
 
+--- 系列下拉：全部 / 无系列（countsBy 的空桶行）/ 具体系列，单选，再点已选项取消。
+---@param anchor table 按钮矩形
+---@param data table filtersAsync 返回的 data
+---@param filter table 当前筛选条件（不修改，回调拿副本）
+---@param on_pick fun(filter: table)
+---@return table list
+function Filter.openSeries(anchor, data, filter, on_pick)
+    local items = {
+        {
+            text = _("全部系列"),
+            checked = filter.series == nil and not filter.unseries,
+            callback = function()
+                local f = copy(filter)
+                f.series, f.unseries = nil, nil
+                on_pick(f)
+            end,
+        },
+    }
+    for _idx, row in ipairs(data.series_counts or {}) do
+        local value = row.series
+        if value == "" then
+            items[#items + 1] = {
+                text = T(_("无系列（%1）"), tonumber(row.count) or 0),
+                checked = filter.unseries == true,
+                callback = function()
+                    local f = copy(filter)
+                    f.series, f.unseries = nil, not filter.unseries or nil
+                    on_pick(f)
+                end,
+            }
+        else
+            local on = filter.series == value
+            items[#items + 1] = {
+                text = T(_("%1（%2）"), value, tonumber(row.count) or 0),
+                checked = on,
+                callback = function()
+                    local f = copy(filter)
+                    f.series, f.unseries = not on and value or nil, nil
+                    on_pick(f)
+                end,
+            }
+        end
+    end
+    return show(anchor, items)
+end
+
+--- 标签下拉：全部 / 无标签（countsBy 的空桶行）/ 具体标签，单选，再点已选项取消。
+---@param anchor table 按钮矩形
+---@param data table filtersAsync 返回的 data
+---@param filter table 当前筛选条件（不修改，回调拿副本）
+---@param on_pick fun(filter: table)
+---@return table list
+function Filter.openTag(anchor, data, filter, on_pick)
+    local items = {
+        {
+            text = _("全部标签"),
+            checked = filter.category == nil and not filter.uncategorized,
+            callback = function()
+                local f = copy(filter)
+                f.category, f.uncategorized = nil, nil
+                on_pick(f)
+            end,
+        },
+    }
+    for _idx, row in ipairs(data.tag_counts or {}) do
+        local value = row.category
+        if value == "" then
+            items[#items + 1] = {
+                text = T(_("无标签（%1）"), tonumber(row.count) or 0),
+                checked = filter.uncategorized == true,
+                callback = function()
+                    local f = copy(filter)
+                    f.category, f.uncategorized = nil, not filter.uncategorized or nil
+                    on_pick(f)
+                end,
+            }
+        else
+            local on = filter.category == value
+            items[#items + 1] = {
+                text = T(_("%1（%2）"), value, tonumber(row.count) or 0),
+                checked = on,
+                callback = function()
+                    local f = copy(filter)
+                    f.category, f.uncategorized = not on and value or nil, nil
+                    on_pick(f)
+                end,
+            }
+        end
+    end
+    return show(anchor, items)
+end
+
 return Filter
