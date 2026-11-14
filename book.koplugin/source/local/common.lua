@@ -289,14 +289,70 @@ local function ensureCover(path)
     end
 end
 
---- 解析单本书元数据 + 封面；失败返回 nil（损坏 / 无引擎）。
+--- 读 KOReader sidecar 的 doc_props（KOReader 打开过就有），不碰引擎。
+---@param path string
+---@return table|nil
+local function readSidecarProps(path)
+    local ok, props = pcall(function()
+        local DocSettings = require("docsettings")
+        local ds = DocSettings:open(path)
+        local p = ds:readSetting("doc_props")
+        ds:close()
+        return p
+    end)
+    if ok and type(props) == "table" and (props.title or props.authors or props.description) then
+        return props
+    end
+    return nil
+end
+
+--- 多值字符串规范化：分号 / 逗号 / 顿号 / 中点 / 制表 / 换行 都认，去重后换行拼接。
+---@param raw string|nil
+---@return string|nil
+local function normalizeList(raw)
+    if type(raw) ~= "string" or raw == "" then return nil end
+    local s = raw
+        :gsub(";", "\n")
+        :gsub(",", "\n")
+        :gsub("\t", "\n")
+        :gsub("\227\128\129", "\n")  -- 顿号 U+3001
+        :gsub("\194\183", "\n")      -- 中点 U+00B7
+    local list, seen = {}, {}
+    for tag in s:gmatch("[^\n]+") do
+        tag = Text.trim(tag)
+        if tag ~= "" and not seen[tag] then
+            seen[tag] = true
+            list[#list + 1] = tag
+        end
+    end
+    return #list > 0 and table.concat(list, "\n") or nil
+end
+
+--- 解析单本书元数据 + 封面；优先 sidecar 的 doc_props，没有才开引擎。
 ---@param path string 书路径
 ---@param cover_key string|nil 封面缓存键（stable_id）；缺省即 path
 ---@return { title: string|nil, authors: string|nil, intro: string|nil, language: string|nil }|nil
 local function parseBookProps(path, cover_key)
+    local side = readSidecarProps(path)
+    if side then
+        local key = cover_key or path
+        if lfs.attributes(coverPath(key), "mode") ~= "file" then
+            pcall(withDocument, path, function(doc)
+                saveDocumentCover(doc, key)
+            end)
+        end
+        return {
+            title = field(side.title),
+            authors = field(side.authors),
+            intro = field(Text.stripHtml(side.description)),
+            language = field(side.language),
+            series = normalizeList(side.series),
+            series_index = tonumber(side.series_index),
+            keywords = normalizeList(side.keywords),
+        }
+    end
     local ok, props = pcall(withDocument, path, function(doc)
         local p = doc:getProps()
-        -- 封面：与元数据同会话提取（无封面的格式返回 nil）
         saveDocumentCover(doc, cover_key or path)
         return p
     end)
@@ -308,6 +364,9 @@ local function parseBookProps(path, cover_key)
         authors = field(props.authors),
         intro = field(Text.stripHtml(props.description)),
         language = field(props.language),
+        series = normalizeList(props.series),
+        series_index = tonumber(props.series_index),
+        keywords = normalizeList(props.keywords),
     }
 end
 
@@ -330,7 +389,7 @@ local function scanFiles(root, flat)
     ---@param category string|nil 继承的分类（一级子目录名）
     ---@param series string|nil 继承的系列（二级子目录名）
     ---@param depth number 当前层级，根为 1
-    local function walk(dir, category, series, depth)
+    local function walk(dir, series, category, depth)
         local ok, iter, state = pcall(lfs.dir, dir)
         if not ok then
             if depth == 1 then error(iter, 0) end
@@ -347,13 +406,13 @@ local function scanFiles(root, flat)
                     if attr.mode == "directory" then
                         -- KOReader 的 .sdr 边车目录不是书籍分类，不下钻；软链接目录也不跟（可能指回上级，扫出根外）
                         if name:sub(-4) ~= ".sdr" and lfs.symlinkattributes(path, "mode") ~= "link" then
-                            -- 下钻：根下的一级目录名是分类，分类下的二级目录名是系列
+                            -- 下钻：根下的一级目录名是系列，分类下的二级目录名是分类
                             if flat then
-                                walk(path, category, series, depth + 1)
+                                walk(path, series, category, depth + 1)
                             elseif depth == 1 then
-                                walk(path, name, nil, depth + 1)
+                                walk(path, name, nil, depth + 1)      -- 一级目录 = 系列
                             elseif depth == 2 then
-                                walk(path, category, name, depth + 1)
+                                walk(path, series, name, depth + 1)   -- 二级目录 = 分类
                             end
                         end
                     elseif attr.mode == "file" and isBookFile(name) and not isDrmMobi(name, path) then
@@ -480,4 +539,6 @@ return {
     notesRemotePath = notesRemotePath,
     fetchText = fetchText,
     putText = putText,
+    readSidecarProps = readSidecarProps,
+    normalizeList = normalizeList,
 }
