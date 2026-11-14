@@ -34,8 +34,8 @@ function Detail:openEditor()
         fields = {
             { label = _("书名"), text = initial.title },
             { label = _("作者"), text = initial.author },
-            { label = _("标签"), text = initial.category },
             { label = _("系列"), text = initial.series },
+            { label = _("标签"), text = initial.category },
         },
         ok_text = _("保存"),
         callback = function(...) self:saveMeta({ ... }) end,
@@ -57,8 +57,8 @@ function Detail:saveMeta(fields)
     end
     local title = nonempty(fields[1])
     local authors = nonempty(fields[2])
-    local category = nonempty(fields[3])
-    local series = nonempty(fields[4])
+    local series = nonempty(fields[3])
+    local category = nonempty(fields[4])
     local initial = self._edit_initial or {}
     self._edit_initial = nil
     local function changed(key, value)
