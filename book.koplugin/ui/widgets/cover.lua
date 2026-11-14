@@ -118,7 +118,7 @@ function CoverCell.build(ctx, book, slot_w, cw, ch, on_open, show_status, show_t
     local card, _card_h, cover = Book.widget(ctx.plugin, ctx.source, book, cw, ch, opts)
     local extra = lib and lib.extra
     local function act(fn)
-        return fn and function() fn(book, cover, cw, ch) end
+        return fn and function() fn(book, cover, cw, ch, card.dimen) end
     end
     local tap = Tap.wrap(card, function() on_open(book, cover, cw, ch) end,
         extra and act(extra.hold), extra and act(extra.double))
