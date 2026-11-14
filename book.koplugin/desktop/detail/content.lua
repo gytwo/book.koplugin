@@ -65,7 +65,11 @@ local function infoItems(book, owner)
         { _("来源"), sid == "zlib" and _("Z站") or sid == "opds" and _("OPDS")
             or sid and ((require("source.registry").meta(sid) or {}).name or sid) },
         { _("状态"), m.status },
-        { _("标签"), m.tags, true, true },
+        { _("标签"),
+            book.source_id == "local"
+                and require("book.terms_db").getTermsText(book.source_id, book.stable_id, "category")
+                or (book.category and book.category ~= "" and book.category or nil),
+            true, true },
         { _("格式"), format and format:upper() },
         { _("大小"), size and size > 0 and require("util").getFriendlySize(size) },
         { _("加入"), added > 0 and os.date("%Y-%m-%d", added) },
@@ -254,7 +258,11 @@ function Detail:buildHead(w, owner, primary)
 
     local sw = math.max(1, w - cw - gap)
     local small = Theme.px(t.space.xs)
-    local author = Book.author(book)
+    local TermsDB = require("book.terms_db")
+    local is_local = book.source_id == "local"
+    local author = is_local
+        and (TermsDB.getTermsText(book.source_id, book.stable_id, "author", "、") or Book.author(book))
+        or Book.author(book)
     local top = VerticalGroup:new{
         align = "left",
         Text.box("title", Book.title(book), sw, { max_lines = 3, transparent = true }),
@@ -262,10 +270,13 @@ function Detail:buildHead(w, owner, primary)
         Text.line("body", author ~= "" and author or _("未知作者"), { width = sw }),
     }
     local tags = {}
-    if book.series and book.series ~= "" then tags[#tags + 1] = book.series end
-    if book.category and book.category ~= "" then tags[#tags + 1] = (book.category:gsub("[,\n]+", " · ")) end
+    local series_text = is_local and TermsDB.getTermsText(book.source_id, book.stable_id, "series")
+        or (book.series and book.series ~= "" and book.series or nil)
+    if series_text then tags[#tags + 1] = series_text end
+    local category_text = is_local and TermsDB.getTermsText(book.source_id, book.stable_id, "category")
+        or (book.category and book.category ~= "" and book.category or nil)
+    if category_text then tags[#tags + 1] = category_text end
     local m = book.meta or {}
-    if m.tags and m.tags ~= "" then tags[#tags + 1] = m.tags end
     local pub = {}
     if m.publisher then pub[#pub + 1] = m.publisher end
     if m.published then pub[#pub + 1] = m.published end

@@ -318,6 +318,8 @@ local function currentTarget(self)
         if not (wechat and wechat:configured() and wechat:paragraphReviewsEnabled()) then return nil end
         return chapterTarget(self, identity, wechat)
     end
+    -- 👇👇👇 就是改这里 👇👇👇
+    -- 本地书：各源在 Linked.target 内按自己的开关判断，互不牵连
     return Linked.target(self.ui, self.cache, function() redraw(self) end)
 end
 
@@ -368,10 +370,15 @@ function ReviewMarks:updateView()
     local marks = {}
     for _idx, placement in ipairs(target.place(self.data)) do
         local entry = placement.entry
+        local badge = entry.spot.badge
+        if not badge and entry.identity and entry.identity.source_id == "fanqie" then
+            local n = tonumber(entry.spot.total) or 0
+            badge = n > 99 and "99+" or tostring(n)
+        end
         marks[#marks + 1] = {
             spot = entry.spot,
             boxes = placement.boxes,
-            badge = entry.spot.badge,
+            badge = badge,
             heading = entry.spot.heading,
             tap = function() require("features.reviews.sheet").open(entry.identity, entry.spot) end,
         }

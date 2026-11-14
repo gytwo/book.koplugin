@@ -105,13 +105,17 @@ function Setting.rows(plugin)
         local cfg = Settings.getSource(SOURCE_ID)
         local on = cfg.folder_category ~= false
         return Row.widget({ width = iw, chevron = false, kind = "toggle", icon = "folder",
-            title = _("按文件夹分类"), subtitle = _("第一层文件夹作为分类，第二层作为系列"),
+            title = _("按文件夹分组"), subtitle = _("第一层文件夹作为系列，第二层作为标签"),
             status = on and _("开") or _("关"), status_on = on,
             callback = function()
                 cfg.folder_category = not on
                 Settings.saveSource(SOURCE_ID, cfg)
                 -- 关闭：目录派生的分类 / 系列一次清掉，之后只由手动编辑设置；打开：下次扫盘按目录重算。
-                if on then require("book.books_db").clearCategories(SOURCE_ID) end
+                if on then
+                    require("book.books_db").clearCategories(SOURCE_ID)
+                    require("book.terms_db").clearKind(SOURCE_ID, "category", "folder")
+                    require("book.terms_db").clearKind(SOURCE_ID, "series", "folder")
+                end
                 -- cfg 是源实例的共享表，改完即可见。只重扫本地书，不要 Registry.reload：
                 -- 那会广播换源，设置页把叠层全部关掉，人还停在这一行上就被扔回设置根页。
                 local desktop = plugin and plugin.desktop

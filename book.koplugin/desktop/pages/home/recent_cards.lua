@@ -114,11 +114,11 @@ function Perspective:paintTo(bb, x, y)
     -- 只提亮圆角以内：角外露的是下面邻卡 / 页面，整块提亮会在角上留白方块。
     local w, h = self.dimen.w, self.dimen.h
     local r = coverRadius(w, h)
-    bb:lightenRect(x, y + r, w, h - 2 * r)
+    bb:lightenRect(x, y + r, w, h - 2 * r, 0)
     for j = 0, r - 1 do
         local inset = cornerInset(j, r)
-        bb:lightenRect(x + inset, y + j, w - 2 * inset, 1)
-        bb:lightenRect(x + inset, y + h - 1 - j, w - 2 * inset, 1)
+        bb:lightenRect(x + inset, y + j, w - 2 * inset, 1, 0)
+        bb:lightenRect(x + inset, y + h - 1 - j, w - 2 * inset, 1, 0)
     end
 end
 

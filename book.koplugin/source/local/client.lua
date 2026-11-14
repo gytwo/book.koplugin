@@ -132,6 +132,7 @@ Client.importAsync = Scan.importAsync
 Client.moveBook = Scan.moveBook
 Client.indexOneAsync = Scan.indexOneAsync
 Client.scanAsync = Scan.scanAsync
+Client.refreshBookMetaAsync = Scan.refreshBookMetaAsync
 
 Client.scanWebdavAsync = LocalWebdav.scanWebdavAsync
 Client.openWebdavAsync = LocalWebdav.openWebdavAsync

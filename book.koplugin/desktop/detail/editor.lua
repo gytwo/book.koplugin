@@ -9,20 +9,31 @@ local bookSupportsEdit = Common.bookSupportsEdit
 local _ = require("gettext")
 
 return function(Detail)
---- 编辑元信息对话框（书名/作者/分类/系列）。
+--- 编辑元信息对话框（书名/作者/标签/系列）。
 function Detail:openEditor()
     local book = self.book
     if not bookSupportsEdit(book, self.source) then
         Toast:new{ text = _("当前数据源不支持编辑"), timeout = 2 }:show()
         return
     end
+    local TermsDB = require("book.terms_db")
+    local function current_text(kind, fallback)
+        return TermsDB.getTermsText(book.source_id, book.stable_id, kind) or fallback or ""
+    end
+    local initial = {
+        title = book.title or "",
+        author = current_text("author", Book.author(book)),
+        category = current_text("category", book.category),
+        series = current_text("series", book.series),
+    }
+    self._edit_initial = initial
     Input:new{
         title = _("编辑元信息"),
         fields = {
-            { label = _("书名"), text = book.title or "" },
-            { label = _("作者"), text = Book.author(book) },
-            { label = _("分类"), text = book.category or "" },
-            { label = _("系列"), text = book.series or "" },
+            { label = _("书名"), text = initial.title },
+            { label = _("作者"), text = initial.author },
+            { label = _("系列"), text = initial.series },
+            { label = _("标签"), text = initial.category },
         },
         ok_text = _("保存"),
         callback = function(...) self:saveMeta({ ... }) end,
@@ -38,43 +49,45 @@ function Detail:saveMeta(fields)
     if not bookSupportsEdit(book, self.source) then
         return
     end
-    --- 空串归一为 nil：空标题才能回退 stable_id 显示
-    ---@param s string 输入框文本
-    ---@return string|nil
     local function nonempty(s)
         s = Text.trim(s)
         return s ~= "" and s or nil
     end
     local title = nonempty(fields[1])
     local authors = nonempty(fields[2])
-    local category = nonempty(fields[3])
-    local series = nonempty(fields[4])
+    local series = nonempty(fields[3])
+    local category = nonempty(fields[4])
+    local initial = self._edit_initial or {}
+    self._edit_initial = nil
+    local function changed(key, value)
+        return (value or "") ~= (initial[key] or "")
+    end
     local owner = Common.bookOwnerSource(book, self.source)
     local sid = book.stable_id
-    if type(owner.moveBook) == "function" then
-        if not category then
-            series = nil -- 本地源系列必须挂在分类下，与扫盘派生语义一致
-        end
-        local moved, err = owner:moveBook(book.stable_id, category, series)
-        if not moved then
-            if not self.closed then Toast:new{ text = err, timeout = 2 }:show() end
-            return
-        end
-        sid = moved
-    end
     local BookDB = require("book.books_db")
     local existing = BookDB.get(book.source_id, sid)
+    -- books 列只写改了的字段，没改的保持原值
     local saved = BookDB.upsertLocal({
         source_id = book.source_id,
         stable_id = sid,
-        title = title,
-        authors = authors,
-        category = category,
-        series = series,
+        title = changed("title", title) and title or book.title,
+        authors = changed("author", authors) and authors or book.authors,
+        category = changed("category", category) and category or book.category,
+        series = changed("series", series) and series or book.series,
         intro = existing and existing.intro or nil,
         md5 = existing and existing.md5 or nil,
     })
     if saved then
+        local TermsDB = require("book.terms_db")
+        if changed("author", authors) then
+            TermsDB.setTermsFromString(book.source_id, sid, "author", authors, "user")
+        end
+        if changed("series", series) then
+            TermsDB.setTermsFromString(book.source_id, sid, "series", series, "user")
+        end
+        if changed("category", category) then
+            TermsDB.setTermsFromString(book.source_id, sid, "category", category, "user")
+        end
         owner:onEvent("book_meta_changed", {
             identity = { source_id = book.source_id, stable_id = sid },
             cover = false,
@@ -90,4 +103,3 @@ function Detail:saveMeta(fields)
     Toast:new{ text = _("元数据已更新"), timeout = 1.5 }:show()
 end
 end
-

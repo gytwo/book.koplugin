@@ -13,7 +13,7 @@ reading_stats 提供统计。
 
 --- 图书馆筛选项与分类索引。
 ---@class BookFiltersResult
----@field data { category_counts: { category: string, count: integer }[]|nil, series_counts: { series: string, count: integer }[]|nil, author_counts: { authors: string, count: integer }[]|nil, read_counts: { status: string, count: integer }[]|nil, downloaded_count: integer|nil, hidden_count: integer|nil, source_counts: { source_id: string, name: string, count: integer }[]|nil }|nil
+---@field data { category_counts: { category: string, count: integer }[]|nil, series_counts: { series: string, count: integer }[]|nil, author_counts: { authors: string, count: integer }[]|nil, tag_counts: { category: string, count: integer }[]|nil, read_counts: { status: string, count: integer }[]|nil, downloaded_count: integer|nil, hidden_count: integer|nil, source_counts: { source_id: string, name: string, count: integer }[]|nil }|nil
 
 --- 图书馆 / 书城列表查询参数。
 --- 未使用的筛选项传 nil 或空串；源不支持的项可忽略。
@@ -516,20 +516,32 @@ function Catalog.listBooks(source_id, opts)
         where = where .. " AND b.source_id=?"
         args[#args + 1] = opts.source_id
     end
+    local use_terms = source_id == "local"
+    local TermsDB = require("book.terms_db")
     if opts.uncategorized then
-        where = where .. " AND (b.category IS NULL OR b.category='')"
+        where = where .. (use_terms and (" AND " .. TermsDB.notExistsClause("category", "b"))
+            or " AND (b.category IS NULL OR b.category='')")
     elseif opts.category and opts.category ~= "" then
-        where = where .. " AND b.category=?"
-        args[#args + 1] = opts.category
+        if use_terms then
+            where = where .. " AND " .. TermsDB.existsClause("category", opts.category, "b", args)
+        else
+            where = where .. " AND b.category=?"
+            args[#args + 1] = opts.category
+        end
     end
     if opts.unseries then
-        where = where .. " AND (b.series IS NULL OR b.series='')"
+        where = where .. (use_terms and (" AND " .. TermsDB.notExistsClause("series", "b"))
+            or " AND (b.series IS NULL OR b.series='')")
     elseif opts.series and opts.series ~= "" then
-        where = where .. " AND b.series=?"
-        args[#args + 1] = opts.series
+        if use_terms then
+            where = where .. " AND " .. TermsDB.existsClause("series", opts.series, "b", args)
+        else
+            where = where .. " AND b.series=?"
+            args[#args + 1] = opts.series
+        end
     end
+
     if type(opts.dir) == "string" and opts.dir ~= "" then
-        -- 只取该目录下直接放的书；substr 按字符计，前缀长度也要按字符数。
         local prefix = opts.dir .. "/"
         local chars = select(2, prefix:gsub("[^\128-\191]", ""))
         local expr, root_args = Catalog.folderPathExpr("b", opts.root)
@@ -544,11 +556,17 @@ function Catalog.listBooks(source_id, opts)
             end
         end
     end
+
     if opts.unauthor then
-        where = where .. " AND (b.authors IS NULL OR b.authors='')"
+        where = where .. (use_terms and (" AND " .. TermsDB.notExistsClause("author", "b"))
+            or " AND (b.authors IS NULL OR b.authors='')")
     elseif opts.author and opts.author ~= "" then
-        where = where .. " AND b.authors=?"
-        args[#args + 1] = opts.author
+        if use_terms then
+            where = where .. " AND " .. TermsDB.existsClause("author", opts.author, "b", args)
+        else
+            where = where .. " AND b.authors=?"
+            args[#args + 1] = opts.author
+        end
     end
     if opts.search and opts.search ~= "" then
         where = where .. [[ AND (b.title LIKE ? ESCAPE '\' OR b.authors LIKE ? ESCAPE '\' OR b.stable_id LIKE ? ESCAPE '\')]]
@@ -811,6 +829,8 @@ function Catalog.filtersAsync(source_id, cb)
             read_counts = BookDB.readStatusCountsBySource(scope),
             downloaded_count = BookDB.downloadedCountBySource(scope, chapterSources()),
             hidden_count = BookDB.hiddenCountBySource(scope),
+            series_counts = BookDB.countsBy("series", scope),
+            tag_counts = BookDB.countsBy("category", scope),
         }
         -- 仅多源混合时给出源分组；顺序跟已启用列表，册数来自聚合。
         if type(scope) == "table" then

@@ -20,8 +20,10 @@ local MENU_W = 160
 local ACTIONS = {
     edit = "openEditor",
     scrape = "startScrape",
+    refresh_meta = "refreshMeta",
     download = "chooseCacheRange",
     download_book = "downloadBook",
+    export_epub = "exportEpub",
     read = "toggleRead",
     unread = "toggleRead",
     clear_cache = "clearCache",
@@ -33,9 +35,6 @@ local ACTIONS = {
 
 return function(Detail)
 --- 贴着锚点弹出的窄下拉，工具项按 actionPlan 顺序（删除在末尾）。
----@param self table Detail 实例，或 Detail.openMenu 造的宿主
----@param tools table[] Detail.actionPlan 的工具项
----@param anchor table 锚点矩形 { x, y, w, h }
 local function showTools(self, tools, anchor)
     local items = {}
     for i, def in ipairs(tools) do
@@ -46,20 +45,14 @@ local function showTools(self, tools, anchor)
 end
 
 --- 右上角「更多」。
----@param tools table[] Detail.actionPlan 的工具项
 function Detail:showMenu(tools)
     local slot = Theme.px(self.theme.control.height)
     showTools(self, tools, { x = self.dimen.w - slot, y = 0, w = slot, h = TitleBar.height() })
 end
 
 --- 不开详情页，直接弹详情页右上角同一份菜单（书库「更多」用）。
---- 宿主只带动作要用的字段；没有详情页可关 / 可重画，改动后重建桌面。
----@param desktop table BookDesktop
----@param book table
----@param anchor table 触发按钮的矩形
 function Detail.openMenu(desktop, book, anchor)
     local owner = bookOwnerSource(book, desktop.source)
-    -- 菜单只要「选择卷」入口：只读目录元信息，不做续读目标的全量扫描。
     local meta = owner and owner.readingTarget and owner:readingTarget(book, { meta_only = true }) or nil
     local tools = Detail.actionPlan(book, owner, meta)
     if #tools == 0 then return end
@@ -86,7 +79,8 @@ function Detail:updateView()
     local owner = bookOwnerSource(self.book, self.source)
     local tools, primary = {}, nil
     if self.origin == "store" then
-        primary = self:storePrimary()
+        -- 【修改】接收 storePrimary 返回的 tools
+        primary, tools = self:storePrimary()
     else
         tools, primary = Detail.actionPlan(self.book, owner, self:readingTarget() or false)
         if primary then primary.callback = function() self:openBook() end end
@@ -104,8 +98,6 @@ function Detail:updateView()
     local body_h = h - bar:getSize().h - gap - pad
     local body = self:buildBody(w - pad * 2, body_h, owner, primary)
 
-    -- 先接上新树再释放旧树：reload（刮削/编辑后）会反复重建，旧树里的封面
-    -- BlitBuffer 只在 free 时释放，不放就是每次刮削漏一张全屏封面。
     local old = self[1]
     self:setPanel(Box:new{
         style = { bg = t.color.page },
@@ -116,7 +108,6 @@ function Detail:updateView()
             bar,
             VerticalSpan:new{ width = gap },
             HorizontalGroup:new{ align = "top", HorizontalSpan:new{ width = pad }, body },
-            -- Box 把内容居中：正文短时补足高度，标题栏才贴顶。
             VerticalSpan:new{ width = math.max(0, body_h + pad - body:getSize().h) },
         },
     })

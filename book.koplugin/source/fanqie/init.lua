@@ -1,8 +1,8 @@
 --[[--
 番茄小说官方数据源。
 
-正文走 App reading API：registerkey → batch_full → 解密（reading/）。书架双向（加架 / 移出架经番茄网页接口，Shelf.syncAsync 编排），搜索走免登录端点，进度双向，无笔记、统计。
-封面用 fanqie.lua 的 mobileCover 稳定路径（网页签名 thumb_url 会过期）。19 位设备 id 按 uint64 精确编码；Cookie 没变不重写设置。
+正文走 App reading API（官方）/ 知秋 / 书山，多源回退；
+段评按源分发：官方 / 知秋 / 书山。
 
 @module koplugin.book.source.fanqie
 --]]
@@ -23,7 +23,6 @@ local M = {}
 ---@field settings FanqieSettings
 ---@field client FanqieClient
 
--- 书架双向（shelfActionAsync add/delete）；换账号要重推本地成员。
 local Source = setmetatable({ shelf_add = true }, { __index = Base })
 Source.__index = Source
 
@@ -62,9 +61,7 @@ local function handle()
         cancelled = false,
         cancel = function()
             h.cancelled = true
-            if h.job and h.job.cancel then
-                h.job.cancel()
-            end
+            if h.job and h.job.cancel then h.job.cancel() end
         end,
     }
     return h
@@ -330,6 +327,21 @@ function Source:loadTocAsync(identity, cb)
     return self:refreshTocAsync(identity, cb)
 end
 
+--- 章节序号 → 番茄 item_id，目录来自缓存或在线拉取。
+local function withChapterUid(self, identity, cb, start)
+    local h = handle()
+    h.job = self:loadTocAsync(identity, function(toc, err)
+        if h.cancelled then return end
+        local chapter = toc and toc[tonumber(identity.chapter_idx)]
+        if not chapter then
+            cb(nil, err or _("缺少番茄章节位置"))
+            return
+        end
+        h.job = start(chapter.uid, cb)
+    end)
+    return h
+end
+
 local function comicPath(identity, chapter)
     return Paths.bookWorkDir(identity.stable_id, identity.source_id) .. "/" .. chapter.uid .. ".cbz"
 end
@@ -348,6 +360,75 @@ local function downloadImage(url, cb)
     end)
 end
 
+-- ── 正文多源回退 ──────────────────────────────────────────
+
+--- 按启用的书源依次尝试取正文，失败切下一个。
+--- 成功时在 result 上挂 _source_id，供段评分发。
+---@param self FanqieSource
+---@param identity BookIdentity
+---@param chapter table
+---@param cb fun(result: table|nil, err: string|nil)
+---@return { cancel: fun() }
+local function fetchRawContent(self, identity, chapter, cb)
+    local SourceManager = require("source.fanqie.sources")
+    local sources = SourceManager.get_active_sources(self.settings)
+    if #sources == 0 then
+        return Base.defer(cb, nil, _("无可用书源（请在设置中启用并配置至少一个源）"))
+    end
+
+    local errors = {}
+    local recorded = {}
+    local h = handle()
+
+    local function try(i)
+        if h.cancelled then return end
+        if i > #sources then
+            cb(nil, table.concat(errors, " | "))
+            return
+        end
+        local src = sources[i]
+        local rl = src.config.rate_limit or {}
+        local ok_rl, wait, ts = SourceManager.rate_limit_check(
+            src.id, rl.max_requests, rl.window_seconds)
+        if not ok_rl then
+            errors[#errors + 1] = src.id .. ": 限流中(需等" .. tostring(wait) .. "s)"
+            try(i + 1)
+            return
+        end
+        if ts then recorded[#recorded + 1] = { source_id = src.id, ts = ts } end
+
+        local function on_done(result, err)
+            if h.cancelled then return end
+            if result and result.content then
+                result._source_id = src.id
+                if result._rate_info then
+                    SourceManager.merge_rate_limit_timestamps(result._rate_info)
+                elseif #recorded > 0 then
+                    SourceManager.merge_rate_limit_timestamps(recorded)
+                end
+                cb(result)
+            else
+                errors[#errors + 1] = src.id .. ": " .. errMsg(err)
+                try(i + 1)
+            end
+        end
+
+        if src.id == "official" then
+            h.job = self.client:officialGetContentAsync(identity.stable_id, chapter.uid, on_done)
+        elseif src.id == "zhiqiu" then
+            h.job = require("source.fanqie.zhiqiu").getContentAsync(
+                self.settings, identity.stable_id, chapter.uid, on_done)
+        elseif src.id == "shushan" then
+            h.job = require("source.fanqie.shushan").getContentAsync(
+                self.settings, identity.stable_id, chapter.uid, on_done)
+        else
+            try(i + 1)
+        end
+    end
+    try(1)
+    return h
+end
+
 local function fetch(self, identity, chapter, cb)
     local Content = require("source.fanqie.content")
     Paths.ensureBookWork(identity.stable_id, identity.source_id)
@@ -357,12 +438,15 @@ local function fetch(self, identity, chapter, cb)
         return Base.defer(cb, { file = archive })
     end
     local h = handle()
-    h.job = self.client:officialGetContentAsync(identity.stable_id, chapter.uid, function(result, err)
+    h.job = fetchRawContent(self, identity, chapter, function(result, err)
         if h.cancelled then return end
         if not result then
             cb(nil, errMsg(err))
             return
         end
+        -- 记住正文来源，供段评分发
+        identity.review_source = result._source_id or "official"
+
         local title = result.title ~= "" and result.title or chapter.title
         local urls, key = Comic.parse(result.content)
         if not urls then
@@ -386,6 +470,32 @@ end
 
 -- 番茄正文接口有设备风控，预取与整本下载都按这个间隔逐章请求。
 local FETCH_INTERVAL = 6
+
+--- 拉单章正文（给本地书匹配段评用）。
+---@param identity BookIdentity
+---@param chapter table { uid = ... } 或 { itemId = 章序号 }
+---@param cb fun(result: table|nil, err: string|nil)
+---@return { cancel: fun() }
+function Source:fetchChapterAsync(identity, chapter, cb)
+    if chapter.uid then
+        return fetch(self, identity, { uid = chapter.uid }, cb)
+    end
+    local idx = tonumber(chapter.itemId or identity.chapter_idx)
+    if not idx then
+        return Base.defer(cb, nil, "缺少章节序号")
+    end
+    local h = handle()
+    h.job = self:loadTocAsync(identity, function(toc, err)
+        if h.cancelled then return end
+        local ch = toc and toc[idx]
+        if not ch or not ch.uid then
+            cb(nil, err or "番茄目录缺少该章")
+            return
+        end
+        h.job = fetch(self, identity, { uid = ch.uid }, cb)
+    end)
+    return h
+end
 
 ---@return ChapterFetchContent
 local function contentFetcher(self)
@@ -489,70 +599,92 @@ function Source:putProgressAsync(identity, pos, cb)
     return h
 end
 
+-- ── 段评 ───────────────────────────────────────────────────
+
 --- 阅读页是否显示他人段评（设置页开关，默认关）。
 ---@return boolean
 function Source:paragraphReviewsEnabled()
     return self.settings:get("show_paragraph_reviews", false) == true
 end
 
---- 章节序号 → 番茄 item_id，目录来自缓存或在线拉取。
-local function withChapterUid(self, identity, cb, start)
-    local h = handle()
-    h.job = self:loadTocAsync(identity, function(toc, err)
-        if h.cancelled then return end
-        local chapter = toc and toc[tonumber(identity.chapter_idx)]
-        if not chapter then
-            cb(nil, err or _("缺少番茄章节位置"))
-            return
-        end
-        h.job = start(chapter.uid, cb)
-    end)
-    return h
-end
-
---- 本章有评论的段落（未定位）。
+--- 本章有段评的段落。按 identity.review_source 分发到官方 / 知秋 / 书山。
 ---@param identity BookIdentity
----@param cb fun(hotspots: FanqieReviewHotspot[]|nil, err: string|nil)
+---@param cb fun(hotspots: table[]|nil, err: string|nil)
 ---@return CancelHandle
 function Source:paragraphHotspotsAsync(identity, cb)
     return ReviewCache.hotspotsAsync(identity, function(done)
         return withChapterUid(self, identity, done, function(uid, finish)
-            return require("source.fanqie.reviews").hotspotsAsync(self.settings, uid, finish)
+            local src_id = identity.review_source or "official"
+            if src_id == "official" then
+                return require("source.fanqie.reviews").hotspotsAsync(self.settings, uid, finish)
+            elseif src_id == "zhiqiu" then
+                return require("source.fanqie.zhiqiu").hotspotsAsync(
+                    self.settings, identity.stable_id, uid, finish)
+            elseif src_id == "shushan" then
+                return require("source.fanqie.shushan").hotspotsAsync(
+                    self.settings, identity.stable_id, uid, finish)
+            end
+            finish(nil, _("未知的段评来源: ") .. tostring(src_id))
         end)
     end, cb)
 end
 
 --- 段落按段末文字定位到章节 HTML（子进程里跑，不碰实例状态）。
----@param hotspots FanqieReviewHotspot[]
+--- 官方 / 知秋 / 书山都走同一个定位函数（都是按行号）。
+---@param hotspots table[]
 ---@param html string
 ---@return table[]
 function Source:locateHotspots(hotspots, html)
     return require("source.fanqie.reviews").locate(hotspots, html)
 end
 
---- 某段的一页评论；range 是段落序号，max_idx 是游标偏移（首页 0）。
+--- 某段的一页评论。按 range 前缀分发：
+---   official:<bid>:<cid>:<pid>  /  zhiqiu:<bid>:<cid>:<pid>  /  shushan:<bid>:<cid>:<pid>
+---   官方旧缓存可能是纯数字 pid，按官方处理。
 ---@param identity BookIdentity
----@param range string
+---@param range string|number
 ---@param max_idx integer
----@param cb fun(page: WechatReviewPage|nil, err: string|nil)
+---@param cb fun(page: table|nil, err: string|nil)
 ---@return CancelHandle
 function Source:paragraphReviewPageAsync(identity, range, max_idx, cb)
+    range = tostring(range)
+    local prefix, bid, cid, pid = range:match("^(%w+):([^:]+):([^:]+):([^:]+)$")
+    if prefix == "zhiqiu" then
+        return require("source.fanqie.zhiqiu").pageAsync(
+            self.settings, bid, cid, pid, max_idx, cb)
+    elseif prefix == "shushan" then
+        return require("source.fanqie.shushan").pageAsync(
+            self.settings, bid, cid, pid, max_idx, cb)
+    end
+    local pid_num = tonumber(range)
+    if not pid_num then
+        return Base.defer(cb, nil, _("无效的段评 range: ") .. range)
+    end
     return ReviewCache.pageAsync(identity, range, max_idx, function(done)
         return withChapterUid(self, identity, done, function(uid, finish)
             return require("source.fanqie.reviews").pageAsync(
-                self.settings, identity.stable_id, uid, tonumber(range), max_idx, finish)
+                self.settings, identity.stable_id, uid, pid_num, max_idx, finish)
         end)
     end, cb)
 end
 
---- 某条段评的一页回复。不走段评缓存。
----@param _identity BookIdentity
+--- 某条段评的一页回复。按 identity.review_source 分发。
+---@param identity BookIdentity
 ---@param review_id string
 ---@param max_idx integer|string
----@param cb fun(page: WechatReviewPage|nil, err: string|nil)
+---@param cb fun(page: table|nil, err: string|nil)
 ---@return CancelHandle
-function Source:paragraphReviewRepliesAsync(_identity, review_id, max_idx, cb)
-    return require("source.fanqie.reviews").repliesAsync(self.settings, review_id, max_idx, cb)
+function Source:paragraphReviewRepliesAsync(identity, review_id, max_idx, cb)
+    local src_id = identity.review_source or "official"
+    if src_id == "zhiqiu" then
+        return require("source.fanqie.zhiqiu").repliesAsync(
+            self.settings, identity.stable_id, review_id, max_idx, cb)
+    elseif src_id == "shushan" then
+        return require("source.fanqie.shushan").repliesAsync(
+            self.settings, identity.stable_id, review_id, max_idx, cb)
+    end
+    return require("source.fanqie.reviews").repliesAsync(
+        self.settings, review_id, max_idx, cb)
 end
 
 return M

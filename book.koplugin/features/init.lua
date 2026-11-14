@@ -137,6 +137,7 @@ Features.list = {
     "share",
     "wechat_import",
     "extensions",
+    "quickui_vb",
 }
 
 local External = require("utils.external")

@@ -570,6 +570,10 @@ end
 ---@param x number ReaderView 原点
 ---@param y number
 local function paint(self, bb, x, y)
+    -- 离屏渲染（缩略图、锁屏图等）不叠状态栏：坐标按屏幕算，会越界。
+    if bb ~= Screen.bb then
+        return
+    end
     local ui = self.ui
     local top, bottom = drawn(ui, "top"), drawn(ui, "bottom")
     if not top and not bottom then

@@ -79,8 +79,8 @@ local function groupTabs()
             column = "authors", empty = _("未知作者") },
         { id = "series", text = _("系列"), key = "series", flag = "unseries",
             column = "series", empty = _("无系列") },
-        { id = "category", text = _("分类"), key = "category", flag = "uncategorized",
-            column = "category", empty = _("未分类") },
+        { id = "category", text = _("标签"), key = "category", flag = "uncategorized",
+            column = "category", empty = _("无标签") },
         { id = "folder", text = _("文件夹") },
     }
 end
@@ -280,6 +280,36 @@ function Library:showStatus(anchor)
             return
         end
         Filter.openStatus(anchor, data, self.filter, function(filter)
+            self.filter = filter
+            self:refetch()
+        end)
+    end)
+end
+
+--- 系列下拉。
+---@param anchor table
+function Library:showSeries(anchor)
+    self:loadFilters(function(data, err)
+        if not data then
+            require("ui.themes.widgets.toast"):new{ text = err, timeout = 2 }:show()
+            return
+        end
+        Filter.openSeries(anchor, data, self.filter, function(filter)
+            self.filter = filter
+            self:refetch()
+        end)
+    end)
+end
+
+--- 标签下拉。
+---@param anchor table
+function Library:showTag(anchor)
+    self:loadFilters(function(data, err)
+        if not data then
+            require("ui.themes.widgets.toast"):new{ text = err, timeout = 2 }:show()
+            return
+        end
+        Filter.openTag(anchor, data, self.filter, function(filter)
             self.filter = filter
             self:refetch()
         end)
@@ -733,18 +763,26 @@ local function refreshButton(library)
     }
 end
 
---- 书籍视图的工具条右侧：排序、筛选、视图切换、搜索、刷新，搜索中再加清除。
+--- 书籍视图的工具条右侧：排序、状态、系列、标签、搜索、刷新，搜索中再加清除。
 ---@return table[]
 function Library:bookTools(compact)
-    local sort_btn, status_btn
+    local sort_btn, status_btn, series_btn, tag_btn
     if compact then
         sort_btn = Button:new{
             icon = "sort", variant = "ghost", size = "small",
             callback = function() self:showSort(sort_btn.dimen) end,
         }
         status_btn = Button:new{
-            icon = "filter_list", variant = "ghost", size = "small",
+            icon = "checklist_rtl", variant = "ghost", size = "small",
             callback = function() self:showStatus(status_btn.dimen) end,
+        }
+        series_btn = Button:new{
+            icon = "collections_bookmark", variant = "ghost", size = "small",
+            callback = function() self:showSeries(series_btn.dimen) end,
+        }
+        tag_btn = Button:new{
+            icon = "tag", variant = "ghost", size = "small",
+            callback = function() self:showTag(tag_btn.dimen) end,
         }
     else
         sort_btn = Button:new{
@@ -755,22 +793,23 @@ function Library:bookTools(compact)
             text = Filter.status(self.filter).text, icon = "arrow_drop_down", trailing = true, size = "small",
             callback = function() self:showStatus(status_btn.dimen) end,
         }
+        series_btn = Button:new{
+            text = self.filter.series or _("系列"), icon = "arrow_drop_down", trailing = true, size = "small",
+            callback = function() self:showSeries(series_btn.dimen) end,
+        }
+        tag_btn = Button:new{
+            text = self.filter.category or _("标签"), icon = "arrow_drop_down", trailing = true, size = "small",
+            callback = function() self:showTag(tag_btn.dimen) end,
+        }
     end
     local tools = {
         sort_btn,
         status_btn,
-        Button:new{
-            icon = self.view == "list" and "grid_view" or "view_list", variant = "ghost", size = "small",
-            callback = function() self:toggleView() end,
-        },
+        series_btn,
+        tag_btn,
         Button:new{ icon = "search", variant = "ghost", size = "small", callback = function() self:showSearch() end },
         refreshButton(self),
     }
-    if self.total > 0 and MoonSettings.get("ui").library_random then
-        table.insert(tools, 3, Button:new{
-            icon = "casino", variant = "ghost", size = "small", callback = function() self:openRandom() end,
-        })
-    end
     if self.filter.search then
         tools[#tools + 1] = Button:new{
             icon = "search_off", variant = "ghost", size = "small",
@@ -856,6 +895,15 @@ function Library:buildPage(ctx)
         end
     else
         left = { Text.line("caption", T(_("%1 本书"), self.total), muted) }
+        left[#left + 1] = Button:new{
+            icon = self.view == "list" and "grid_view" or "view_list", variant = "ghost", size = "small",
+            callback = function() self:toggleView() end,
+        }
+        if self.total > 0 and MoonSettings.get("ui").library_random then
+            left[#left + 1] = Button:new{
+                icon = "casino", variant = "ghost", size = "small", callback = function() self:openRandom() end,
+            }
+        end
     end
     local state = self.state or {}
     local books = state.books
@@ -891,7 +939,32 @@ function Library:buildPage(ctx)
         local lib = CoverCell.libraryConf()
         local on_tap = on_open
         if lib.tap_detail then on_tap = function(book) on_detail(book) end end
-        local ACTIONS = { open = on_open, detail = function(book) on_detail(book) end }
+        local ACTIONS = {
+            open   = on_open,
+            detail = function(book) on_detail(book) end,
+            menu   = function(book, _cover, _cw, _ch, dimen)
+                require("desktop.detail").openMenu(self.desktop, book, dimen)
+            end,
+            native = function(book)
+                local path = book.path
+                if not path or path == "" then
+                    require("ui.themes.widgets.toast"):new{ text = _("本书没有本地文件") }:show()
+                    return
+                end
+                local ui = self.desktop.plugin and self.desktop.plugin.ui
+                local fc = ui and ui.file_chooser
+                if not fc then
+                    require("ui.themes.widgets.toast"):new{ text = _("KOReader 菜单仅在有文件管理器时可用") }:show()
+                    return
+                end
+                fc:showFileDialog({
+                    path = path,
+                    is_file = true,
+                    is_go_up = false,
+                    text = book.title or book.stable_id,
+                })
+            end,
+        }
         -- 文件夹条目没有书可开，只响应单击进目录。
         local function bookOnly(action)
             if not action then return nil end
