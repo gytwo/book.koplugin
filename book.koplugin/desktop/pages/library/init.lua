@@ -79,8 +79,8 @@ local function groupTabs()
             column = "authors", empty = _("未知作者") },
         { id = "series", text = _("系列"), key = "series", flag = "unseries",
             column = "series", empty = _("无系列") },
-        { id = "category", text = _("分类"), key = "category", flag = "uncategorized",
-            column = "category", empty = _("未分类") },
+        { id = "category", text = _("标签"), key = "category", flag = "uncategorized",
+            column = "category", empty = _("无标签") },
         { id = "folder", text = _("文件夹") },
     }
 end
