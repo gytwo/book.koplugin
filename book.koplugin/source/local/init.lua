@@ -132,6 +132,17 @@ function Source:coverRequest(identity)
     return nil, _("无封面")
 end
 
+--- 单本重读内嵌元数据（有 sidecar 读 sidecar，没有开引擎）。仅本地目录书。
+---@param stable_id string
+---@param cb fun(ok: boolean, err: string|nil)
+---@return { cancel: fun() }|nil
+function Source:refreshBookMetaAsync(stable_id, cb)
+    if Client.isRemote(stable_id) then
+        return SourceBase.defer(cb, false, _("WebDAV 书籍请用全量刷新"))
+    end
+    return self._client:refreshBookMetaAsync(stable_id, cb)
+end
+
 local skipped = SourceBase.skipped
 
 --- 桌面打开触发的自动同步节流（秒）：反复开桌面不重复扫盘、不重复跑整轮 WebDAV。
@@ -169,8 +180,8 @@ function Source:syncBooksAsync(opts, cb)
             { refresh = opts.force, dirty_only = opts.dirty_only, on_progress = opts.on_progress,
                 on_background = opts.on_background })
     end
-    -- force 只跳过自动同步节流；封面补齐另开进程，不认「手动刷新 = 重提全部封面」。
-    return self._client:scanAsync(done, opts.on_progress)
+    -- force 同时跳过自动同步节流、强制补齐阶段重读全部书的内嵌元数据。
+    return self._client:scanAsync(done, opts.on_progress, opts.force)
 end
 
 --- 纯本地目录没有远端：进度域直接 skipped；WebDAV 走通用 book.progress（开书拉取 + 冲突弹窗，关书推脏）。
