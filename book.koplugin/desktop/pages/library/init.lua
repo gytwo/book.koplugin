@@ -891,7 +891,32 @@ function Library:buildPage(ctx)
         local lib = CoverCell.libraryConf()
         local on_tap = on_open
         if lib.tap_detail then on_tap = function(book) on_detail(book) end end
-        local ACTIONS = { open = on_open, detail = function(book) on_detail(book) end }
+        local ACTIONS = {
+            open   = on_open,
+            detail = function(book) on_detail(book) end,
+            menu   = function(book, _cover, _cw, _ch, dimen)
+                require("desktop.detail").openMenu(self.desktop, book, dimen)
+            end,
+            native = function(book)
+                local path = book.path
+                if not path or path == "" then
+                    require("ui.themes.widgets.toast"):new{ text = _("本书没有本地文件") }:show()
+                    return
+                end
+                local ui = self.desktop.plugin and self.desktop.plugin.ui
+                local fc = ui and ui.file_chooser
+                if not fc then
+                    require("ui.themes.widgets.toast"):new{ text = _("KOReader 菜单仅在有文件管理器时可用") }:show()
+                    return
+                end
+                fc:showFileDialog({
+                    path = path,
+                    is_file = true,
+                    is_go_up = false,
+                    text = book.title or book.stable_id,
+                })
+            end,
+        }
         -- 文件夹条目没有书可开，只响应单击进目录。
         local function bookOnly(action)
             if not action then return nil end
