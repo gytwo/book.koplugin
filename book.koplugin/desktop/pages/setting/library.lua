@@ -35,6 +35,8 @@ local EXTRA_ACTIONS = {
     { value = "none", text = _("无动作") },
     { value = "open", text = _("打开书籍") },
     { value = "detail", text = _("进入详情") },
+    { value = "menu", text = _("弹出菜单") }, 
+    { value = "native", text = _("KOReader 菜单") }, 
 }
 
 ---@param desktop table
