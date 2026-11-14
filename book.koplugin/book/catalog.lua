@@ -13,7 +13,7 @@ reading_stats 提供统计。
 
 --- 图书馆筛选项与分类索引。
 ---@class BookFiltersResult
----@field data { category_counts: { category: string, count: integer }[]|nil, series_counts: { series: string, count: integer }[]|nil, author_counts: { authors: string, count: integer }[]|nil, read_counts: { status: string, count: integer }[]|nil, downloaded_count: integer|nil, hidden_count: integer|nil, source_counts: { source_id: string, name: string, count: integer }[]|nil }|nil
+---@field data { category_counts: { category: string, count: integer }[]|nil, series_counts: { series: string, count: integer }[]|nil, author_counts: { authors: string, count: integer }[]|nil, tag_counts: { category: string, count: integer }[]|nil, read_counts: { status: string, count: integer }[]|nil, downloaded_count: integer|nil, hidden_count: integer|nil, source_counts: { source_id: string, name: string, count: integer }[]|nil }|nil
 
 --- 图书馆 / 书城列表查询参数。
 --- 未使用的筛选项传 nil 或空串；源不支持的项可忽略。
@@ -829,6 +829,8 @@ function Catalog.filtersAsync(source_id, cb)
             read_counts = BookDB.readStatusCountsBySource(scope),
             downloaded_count = BookDB.downloadedCountBySource(scope, chapterSources()),
             hidden_count = BookDB.hiddenCountBySource(scope),
+            series_counts = BookDB.countsBy("series", scope),
+            tag_counts = BookDB.countsBy("category", scope),
         }
         -- 仅多源混合时给出源分组；顺序跟已启用列表，册数来自聚合。
         if type(scope) == "table" then
